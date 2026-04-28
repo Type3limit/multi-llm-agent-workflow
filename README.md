@@ -14,6 +14,9 @@ The core principle is **orchestration, not interception**:
 - [Architecture Blueprint](docs/architecture/multi-agent-llm-workflow-design.md)  
   Full product and architecture design.
 
+- [Design Adjustments](docs/architecture/design-adjustments.md)  
+  Open follow-ups to the blueprint: schema evolution, orchestrator SLIs, backpressure, clock handling, data retention, backups, non-code workspaces, glossary, test strategy, deprecation policy, risk register.
+
 - [Technology Stack Decision](docs/decisions/0001-technology-stack.md)  
   Concrete stack choices for the first implementation.
 
