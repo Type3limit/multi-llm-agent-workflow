@@ -1,0 +1,158 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import SqliteDatabase from "better-sqlite3";
+import type { Database } from "../../src/storage/database.js";
+import { migrate } from "../../src/storage/migrations.js";
+import { SqliteRunStore, type RunRecord } from "../../src/storage/run-store.js";
+
+function makeRecord(overrides: Partial<RunRecord> = {}): RunRecord {
+  return {
+    id: "R-001",
+    project_id: "default",
+    task_id: "T-001",
+    agent_id: "A-001",
+    status: "preparing",
+    ...overrides,
+  };
+}
+
+describe("SqliteRunStore", () => {
+  let db: Database;
+  let store: SqliteRunStore;
+
+  beforeEach(() => {
+    db = new SqliteDatabase(":memory:");
+    migrate(db);
+    store = new SqliteRunStore(db);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it("creates a run and retrieves it", () => {
+    store.create(makeRecord());
+    const record = store.get("R-001");
+    expect(record).toBeDefined();
+    expect(record!.id).toBe("R-001");
+    expect(record!.status).toBe("preparing");
+    expect(record!.task_id).toBe("T-001");
+  });
+
+  it("allows multiple runs for the same task", () => {
+    store.create(makeRecord({ id: "R-001" }));
+    store.create(makeRecord({ id: "R-002", task_id: "T-001" }));
+    expect(store.get("R-001")).toBeDefined();
+    expect(store.get("R-002")).toBeDefined();
+  });
+
+  it("throws on duplicate run id (primary key violation)", () => {
+    store.create(makeRecord({ id: "R-001" }));
+    expect(() => store.create(makeRecord({ id: "R-001" }))).toThrow();
+  });
+
+  it("updateStatus changes status and allowed fields", () => {
+    store.create(makeRecord());
+    store.updateStatus("R-001", "running", {
+      workspace_path: "/tmp/ws",
+      base_commit: "abc123",
+      started_at: "2026-01-01T00:00:00Z",
+    });
+
+    const record = store.get("R-001")!;
+    expect(record.status).toBe("running");
+    expect(record.workspace_path).toBe("/tmp/ws");
+    expect(record.base_commit).toBe("abc123");
+    expect(record.started_at).toBe("2026-01-01T00:00:00Z");
+  });
+
+  it("updateStatus preserves existing values when only status changes", () => {
+    store.create(makeRecord({ workspace_path: "/tmp/original" }));
+    store.updateStatus("R-001", "running");
+    const record = store.get("R-001")!;
+    expect(record.status).toBe("running");
+    expect(record.workspace_path).toBe("/tmp/original");
+  });
+
+  it("updateStatus rejects patch modifying immutable field id", () => {
+    store.create(makeRecord());
+    expect(() =>
+      store.updateStatus("R-001", "running", { id: "R-002" }),
+    ).toThrow("id");
+  });
+
+  it("updateStatus rejects patch modifying project_id", () => {
+    store.create(makeRecord());
+    expect(() =>
+      store.updateStatus("R-001", "running", { project_id: "other" }),
+    ).toThrow("project_id");
+  });
+
+  it("updateStatus rejects patch modifying task_id", () => {
+    store.create(makeRecord());
+    expect(() =>
+      store.updateStatus("R-001", "running", { task_id: "T-other" }),
+    ).toThrow("task_id");
+  });
+
+  it("updateStatus rejects patch modifying agent_id", () => {
+    store.create(makeRecord());
+    expect(() =>
+      store.updateStatus("R-001", "running", { agent_id: "A-other" }),
+    ).toThrow("agent_id");
+  });
+
+  it("get returns undefined for non-existent run", () => {
+    expect(store.get("nonexistent")).toBeUndefined();
+  });
+
+  it("updateStatus throws for non-existent run", () => {
+    expect(() => store.updateStatus("nonexistent", "running")).toThrow(
+      "Run not found",
+    );
+  });
+
+  it("can update all allowed optional fields", () => {
+    store.create(makeRecord());
+    store.updateStatus("R-001", "succeeded", {
+      workspace_path: "/ws",
+      base_commit: "def456",
+      branch_name: "agent/T-001/R-001",
+      run_manifest_ref: "manifest.json",
+      started_at: "2026-01-01T00:00:00Z",
+      ended_at: "2026-01-01T00:05:00Z",
+    });
+    const r = store.get("R-001")!;
+    expect(r.status).toBe("succeeded");
+    expect(r.workspace_path).toBe("/ws");
+    expect(r.base_commit).toBe("def456");
+    expect(r.branch_name).toBe("agent/T-001/R-001");
+    expect(r.run_manifest_ref).toBe("manifest.json");
+    expect(r.started_at).toBe("2026-01-01T00:00:00Z");
+    expect(r.ended_at).toBe("2026-01-01T00:05:00Z");
+  });
+
+  it("optional fields are undefined (not null) after create with only required fields", () => {
+    store.create(makeRecord());
+    const record = store.get("R-001")!;
+    expect(record.workspace_path).toBeUndefined();
+    expect(record.base_commit).toBeUndefined();
+    expect(record.branch_name).toBeUndefined();
+    expect(record.run_manifest_ref).toBeUndefined();
+    expect(record.started_at).toBeUndefined();
+    expect(record.ended_at).toBeUndefined();
+  });
+
+  it("supports terminal statuses succeeded/failed/cancelled", () => {
+    store.create(makeRecord({ id: "R-s" }));
+    store.create(makeRecord({ id: "R-f" }));
+    store.create(makeRecord({ id: "R-c" }));
+
+    store.updateStatus("R-s", "succeeded");
+    store.updateStatus("R-f", "failed");
+    store.updateStatus("R-c", "cancelled");
+
+    expect(store.get("R-s")!.status).toBe("succeeded");
+    expect(store.get("R-f")!.status).toBe("failed");
+    expect(store.get("R-c")!.status).toBe("cancelled");
+  });
+});
