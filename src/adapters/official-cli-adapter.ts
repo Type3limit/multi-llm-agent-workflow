@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import type { ParsedAgentProfile } from "../core/schemas.js";
+import type { ParsedAgentProfileV1 } from "../core/schemas-v1.js";
+
+type RunnableAgentProfile = ParsedAgentProfile | ParsedAgentProfileV1;
 
 export interface AgentProcessResult {
   exitCode: number | null;
@@ -15,7 +18,7 @@ export interface AgentProcessResult {
 
 export interface OfficialCliAdapter {
   run(args: {
-    agentProfile: ParsedAgentProfile;
+    agentProfile: RunnableAgentProfile;
     workspacePath: string;
     promptFile: string;
     timeoutSeconds?: number;
@@ -61,7 +64,7 @@ class OutputTailBuffer {
 
 export class ChildProcessOfficialCliAdapter implements OfficialCliAdapter {
   async run(args: {
-    agentProfile: ParsedAgentProfile;
+    agentProfile: RunnableAgentProfile;
     workspacePath: string;
     promptFile: string;
     timeoutSeconds?: number;

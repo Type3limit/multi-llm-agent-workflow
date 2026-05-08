@@ -19,6 +19,9 @@ export interface RunRecord {
   run_manifest_ref?: string;
   started_at?: string;
   ended_at?: string;
+  role?: "implementer" | "reviewer";
+  parent_run_id?: string;
+  handoff_packet_uri?: string;
 }
 
 export interface RunStore {
@@ -39,11 +42,11 @@ export class SqliteRunStore implements RunStore {
       insert into agent_runs (
         id, project_id, task_id, agent_id, status,
         workspace_path, base_commit, branch_name, run_manifest_ref,
-        started_at, ended_at
+        started_at, ended_at, role, parent_run_id, handoff_packet_uri
       ) values (
         @id, @project_id, @task_id, @agent_id, @status,
         @workspace_path, @base_commit, @branch_name, @run_manifest_ref,
-        @started_at, @ended_at
+        @started_at, @ended_at, @role, @parent_run_id, @handoff_packet_uri
       )
     `) as unknown as Stmt;
 
@@ -57,7 +60,10 @@ export class SqliteRunStore implements RunStore {
         branch_name = @branch_name,
         run_manifest_ref = @run_manifest_ref,
         started_at = @started_at,
-        ended_at = @ended_at
+        ended_at = @ended_at,
+        role = @role,
+        parent_run_id = @parent_run_id,
+        handoff_packet_uri = @handoff_packet_uri
       where id = @id
     `) as unknown as Stmt;
   }
@@ -75,6 +81,9 @@ export class SqliteRunStore implements RunStore {
       run_manifest_ref: record.run_manifest_ref ?? null,
       started_at: record.started_at ?? null,
       ended_at: record.ended_at ?? null,
+      role: record.role ?? null,
+      parent_run_id: record.parent_run_id ?? null,
+      handoff_packet_uri: record.handoff_packet_uri ?? null,
     });
   }
 
@@ -101,6 +110,9 @@ export class SqliteRunStore implements RunStore {
       run_manifest_ref: patch?.run_manifest_ref ?? existing.run_manifest_ref ?? null,
       started_at: patch?.started_at ?? existing.started_at ?? null,
       ended_at: patch?.ended_at ?? existing.ended_at ?? null,
+      role: patch?.role ?? existing.role ?? null,
+      parent_run_id: patch?.parent_run_id ?? existing.parent_run_id ?? null,
+      handoff_packet_uri: patch?.handoff_packet_uri ?? existing.handoff_packet_uri ?? null,
     });
   }
 
@@ -119,6 +131,9 @@ export class SqliteRunStore implements RunStore {
       run_manifest_ref: nullableString(row.run_manifest_ref),
       started_at: nullableString(row.started_at),
       ended_at: nullableString(row.ended_at),
+      role: nullableString(row.role) as RunRecord["role"],
+      parent_run_id: nullableString(row.parent_run_id),
+      handoff_packet_uri: nullableString(row.handoff_packet_uri),
     };
   }
 }

@@ -12,6 +12,10 @@ export function generateArtifactId(): string {
   return `A-${randomUUID().slice(0, 8)}`;
 }
 
+export function generateDecisionId(): string {
+  return `D-${randomUUID().slice(0, 8)}`;
+}
+
 export function sha256hex(content: string | Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }

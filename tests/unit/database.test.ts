@@ -15,19 +15,23 @@ describe("openDatabase()", () => {
     expect(db.open).toBe(true);
   });
 
-  it("after migrate, all four tables exist", () => {
+  it("after migrate, all user tables exist", () => {
     migrate(db);
     const tables = db
       .prepare(
         "select name from sqlite_master where type = 'table' order by name",
       )
       .all()
-      .map((r: unknown) => (r as Record<string, string>).name);
+      .map((r: unknown) => (r as Record<string, string>).name)
+      .filter((t: string) => t !== "sqlite_sequence");
     expect(tables).toEqual([
+      "agent_metrics",
       "agent_runs",
       "agent_usage",
       "artifacts",
+      "task_budget",
       "task_events",
+      "task_queue",
     ]);
   });
 

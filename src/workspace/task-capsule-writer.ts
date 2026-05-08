@@ -1,8 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ParsedWorkOrder } from "../core/schemas.js";
-import type { RunManifest } from "../core/types.js";
+import type { ParsedWorkOrderV1 } from "../core/schemas-v1.js";
+import type { RunManifest, RunManifestV1 } from "../core/types.js";
 import { RunManifestSchema } from "../core/schemas.js";
+import { RunManifestV1Schema } from "../core/schemas-v1.js";
 
 export interface TaskCapsuleWriteResult {
   capsulePath: string;
@@ -14,16 +16,16 @@ export interface TaskCapsuleWriteResult {
 export interface TaskCapsuleWriter {
   write(args: {
     workspacePath: string;
-    workOrder: ParsedWorkOrder;
-    runManifest: RunManifest;
+    workOrder: ParsedWorkOrder | ParsedWorkOrderV1;
+    runManifest: RunManifest | RunManifestV1;
   }): TaskCapsuleWriteResult;
 }
 
 export class FileTaskCapsuleWriter implements TaskCapsuleWriter {
   write(args: {
     workspacePath: string;
-    workOrder: ParsedWorkOrder;
-    runManifest: RunManifest;
+    workOrder: ParsedWorkOrder | ParsedWorkOrderV1;
+    runManifest: RunManifest | RunManifestV1;
   }): TaskCapsuleWriteResult {
     const ws = path.resolve(args.workspacePath);
 
@@ -58,7 +60,7 @@ export class FileTaskCapsuleWriter implements TaskCapsuleWriter {
     };
   }
 
-  private writeWorkOrderMd(capsuleDir: string, wo: ParsedWorkOrder): string {
+  private writeWorkOrderMd(capsuleDir: string, wo: ParsedWorkOrder | ParsedWorkOrderV1): string {
     const filePath = path.join(capsuleDir, "work_order.md");
     const lines = [
       "# Work Order",
@@ -94,8 +96,8 @@ export class FileTaskCapsuleWriter implements TaskCapsuleWriter {
 
   private writeConstraintsJson(
     capsuleDir: string,
-    wo: ParsedWorkOrder,
-    rm: RunManifest,
+    wo: ParsedWorkOrder | ParsedWorkOrderV1,
+    rm: RunManifest | RunManifestV1,
   ): string {
     const filePath = path.join(capsuleDir, "constraints.json");
     const content = {
@@ -115,8 +117,12 @@ export class FileTaskCapsuleWriter implements TaskCapsuleWriter {
     return filePath;
   }
 
-  private writeRunManifestJson(capsuleDir: string, rm: RunManifest): string {
-    RunManifestSchema.parse(rm);
+  private writeRunManifestJson(capsuleDir: string, rm: RunManifest | RunManifestV1): string {
+    if ("role" in rm) {
+      RunManifestV1Schema.parse(rm);
+    } else {
+      RunManifestSchema.parse(rm);
+    }
     const filePath = path.join(capsuleDir, "run_manifest.json");
     fs.writeFileSync(filePath, JSON.stringify(rm, null, 2) + "\n", "utf-8");
     return filePath;

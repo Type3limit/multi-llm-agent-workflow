@@ -155,4 +155,45 @@ describe("SqliteRunStore", () => {
     expect(store.get("R-f")!.status).toBe("failed");
     expect(store.get("R-c")!.status).toBe("cancelled");
   });
+
+  // ─── v1 fields ──────────────────────────────────────────────────────
+
+  it("v0 record (no role) still create/get works, role/parent/handoff are undefined", () => {
+    store.create(makeRecord());
+    const r = store.get("R-001")!;
+    expect(r.role).toBeUndefined();
+    expect(r.parent_run_id).toBeUndefined();
+    expect(r.handoff_packet_uri).toBeUndefined();
+  });
+
+  it("v1 record with role, parent_run_id, handoff_packet_uri survives round-trip", () => {
+    store.create(makeRecord({
+      role: "implementer",
+      parent_run_id: "R-parent",
+      handoff_packet_uri: "artifact://T-1/R-parent/handoff_packet.json",
+    }));
+    const r = store.get("R-001")!;
+    expect(r.role).toBe("implementer");
+    expect(r.parent_run_id).toBe("R-parent");
+    expect(r.handoff_packet_uri).toBe("artifact://T-1/R-parent/handoff_packet.json");
+  });
+
+  it("v1 reviewer role survives round-trip", () => {
+    store.create(makeRecord({ id: "R-review", role: "reviewer" }));
+    const r = store.get("R-review")!;
+    expect(r.role).toBe("reviewer");
+  });
+
+  it("updateStatus can patch role, parent_run_id, handoff_packet_uri", () => {
+    store.create(makeRecord());
+    store.updateStatus("R-001", "running", {
+      role: "reviewer",
+      parent_run_id: "R-parent",
+      handoff_packet_uri: "uri://handoff",
+    });
+    const r = store.get("R-001")!;
+    expect(r.role).toBe("reviewer");
+    expect(r.parent_run_id).toBe("R-parent");
+    expect(r.handoff_packet_uri).toBe("uri://handoff");
+  });
 });

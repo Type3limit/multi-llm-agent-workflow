@@ -1,7 +1,7 @@
 import type { Database } from "./database.js";
 import type { EventEnvelope, EventPayload } from "../core/types.js";
 import { EventEnvelopeSchema } from "../core/schemas.js";
-import { assertKnownEventType, assertRequiredEventIds } from "../core/events.js";
+import { assertKnownEventTypeV1, assertRequiredEventIds, assertV1PayloadFields } from "../core/events.js";
 import { nullableString } from "./helpers.js";
 
 interface Stmt {
@@ -38,8 +38,9 @@ export class SqliteEventLog implements EventLog {
 
   append(event: EventEnvelope): void {
     EventEnvelopeSchema.parse(event);
-    assertKnownEventType(event.event_type);
+    assertKnownEventTypeV1(event.event_type);
     assertRequiredEventIds(event);
+    assertV1PayloadFields(event);
 
     this.insertStmt.run({
       id: event.event_id,

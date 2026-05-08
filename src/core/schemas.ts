@@ -4,9 +4,15 @@ import type {
   ArtifactRef,
   EventEnvelope,
   EventPayload,
+  WorkOrderV0,
+  WorkOrderV1,
+  AgentProfileV0,
+  AgentProfileV1,
 } from "./types.js";
+import { WorkOrderV1Schema, AgentProfileV1Schema } from "./schemas-v1.js";
+import type { ParsedWorkOrderV1, ParsedAgentProfileV1 } from "./schemas-v1.js";
 
-// ─── WorkOrder ───────────────────────────────────────────────────────────────
+// ─── WorkOrder v0 ────────────────────────────────────────────────────────────
 
 export const WorkOrderSchema = z.object({
   schema_version: z.literal("workflow/v0"),
@@ -52,11 +58,24 @@ export const WorkOrderSchema = z.object({
 
 export type ParsedWorkOrder = z.infer<typeof WorkOrderSchema>;
 
-export function parseWorkOrder(input: unknown): ParsedWorkOrder {
-  return WorkOrderSchema.parse(input);
+// ─── WorkOrder v0/v1 discriminated dispatch ──────────────────────────────────
+
+export type WorkOrder = ParsedWorkOrder | ParsedWorkOrderV1;
+
+export function parseWorkOrder(input: unknown): WorkOrder {
+  const schemaVersion = getSchemaVersion(input);
+  if (schemaVersion === "workflow/v0") {
+    return WorkOrderSchema.parse(input);
+  }
+  if (schemaVersion === "workflow/v1") {
+    return WorkOrderV1Schema.parse(input);
+  }
+  throw new Error(
+    `Unsupported schema_version: "${schemaVersion}". Only "workflow/v0" and "workflow/v1" are accepted in v1.`,
+  );
 }
 
-// ─── AgentProfile ────────────────────────────────────────────────────────────
+// ─── AgentProfile v0 ─────────────────────────────────────────────────────────
 
 export const AgentProfileSchema = z.object({
   schema_version: z.literal("workflow/v0"),
@@ -88,8 +107,31 @@ export const AgentProfileSchema = z.object({
 
 export type ParsedAgentProfile = z.infer<typeof AgentProfileSchema>;
 
-export function parseAgentProfile(input: unknown): ParsedAgentProfile {
-  return AgentProfileSchema.parse(input);
+// ─── AgentProfile v0/v1 discriminated dispatch ───────────────────────────────
+
+export type AgentProfile = ParsedAgentProfile | ParsedAgentProfileV1;
+
+export function parseAgentProfile(input: unknown): AgentProfile {
+  const schemaVersion = getSchemaVersion(input);
+  if (schemaVersion === "workflow/v0") {
+    return AgentProfileSchema.parse(input);
+  }
+  if (schemaVersion === "workflow/v1") {
+    return AgentProfileV1Schema.parse(input);
+  }
+  throw new Error(
+    `Unsupported schema_version: "${schemaVersion}". Only "workflow/v0" and "workflow/v1" are accepted in v1.`,
+  );
+}
+
+// ─── Version extraction helper ───────────────────────────────────────────────
+
+function getSchemaVersion(input: unknown): string {
+  if (input != null && typeof input === "object" && "schema_version" in input) {
+    const v = (input as Record<string, unknown>).schema_version;
+    if (typeof v === "string") return v;
+  }
+  return "<missing>";
 }
 
 // ─── RunManifest ─────────────────────────────────────────────────────────────
@@ -123,6 +165,9 @@ export const ArtifactRefSchema = z.object({
     "verification_output",
     "task_capsule",
     "final_report",
+    "review_verdict",
+    "handoff_packet",
+    "schedule_decision",
   ]),
   checksum: z.string().optional(),
   summary: z.string().optional(),

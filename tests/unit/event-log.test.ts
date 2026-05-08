@@ -68,7 +68,7 @@ describe("SqliteEventLog", () => {
 
   it("throws for unknown event type and does not insert", () => {
     const event = makeEvent({
-      event_type: "task.requeued",
+      event_type: "this.event.does.not.exist",
       task_id: "T-1",
     });
     expect(() => log.append(event)).toThrow("Unknown event type");
@@ -236,5 +236,116 @@ describe("SqliteEventLog", () => {
     // Must be insertion order, not alphabetical by id
     expect(events[0].event_id).toBe("E-ZZZ");
     expect(events[1].event_id).toBe("E-AAA");
+  });
+
+  // ─── v1 events ─────────────────────────────────────────────────────────
+
+  it("appends a valid v1 task.dispatched event", () => {
+    const event = makeEvent({
+      event_id: "E-v1-dispatch",
+      event_type: "task.dispatched",
+      task_id: "T-1",
+      payload: {
+        decision_id: "D-001",
+        role: "implementer",
+        picked_agent_id: "agent-a",
+      },
+    });
+    log.append(event);
+
+    const rows = db
+      .prepare("select event_type, payload_json from task_events where id = ?")
+      .all("E-v1-dispatch") as Array<{ event_type: string; payload_json: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].event_type).toBe("task.dispatched");
+    const p = JSON.parse(rows[0].payload_json);
+    expect(p.decision_id).toBe("D-001");
+    expect(p.role).toBe("implementer");
+  });
+
+  it("rejects reserved event name with 'reserved for v2+'", () => {
+    const event = makeEvent({
+      event_type: "security.secret_leaked",
+      task_id: "T-1",
+    });
+    expect(() => log.append(event)).toThrow("reserved for v2+");
+  });
+
+  it("rejects unknown event type", () => {
+    const event = makeEvent({
+      event_type: "totally.unknown.event",
+      task_id: "T-1",
+    });
+    expect(() => log.append(event)).toThrow("Unknown event type");
+  });
+
+  it("rejects task.dispatched missing payload.decision_id", () => {
+    const event = makeEvent({
+      event_id: "E-bad-dispatch",
+      event_type: "task.dispatched",
+      task_id: "T-1",
+      payload: {
+        role: "implementer",
+        picked_agent_id: "agent-a",
+        // missing decision_id
+      },
+    });
+    expect(() => log.append(event)).toThrow("payload.decision_id");
+  });
+
+  it("rejects task.assigned missing payload.role", () => {
+    const event = makeEvent({
+      event_id: "E-bad-assign",
+      event_type: "task.assigned",
+      task_id: "T-1",
+      run_id: "R-1",
+      agent_id: "A-1",
+      payload: {
+        // missing role
+      },
+    });
+    expect(() => log.append(event)).toThrow("payload.role");
+  });
+
+  it("rejects agent.spawned missing payload.pid", () => {
+    const event = makeEvent({
+      event_id: "E-bad-spawn",
+      event_type: "agent.spawned",
+      task_id: "T-1",
+      run_id: "R-1",
+      agent_id: "A-1",
+      payload: {
+        credential_profile_alias: "team-claude",
+        // missing pid
+      },
+    });
+    expect(() => log.append(event)).toThrow("payload.pid");
+  });
+
+  it("rejects run.failed reason outside the closed taxonomy", () => {
+    const event = makeEvent({
+      event_id: "E-bad-run-failed",
+      event_type: "run.failed",
+      task_id: "T-1",
+      run_id: "R-1",
+      agent_id: "A-1",
+      payload: {
+        reason: "reviewer_unusable",
+      },
+    });
+    expect(() => log.append(event)).toThrow("payload.reason");
+  });
+
+  it("rejects review.completed without verdict_uri", () => {
+    const event = makeEvent({
+      event_id: "E-bad-review-completed",
+      event_type: "review.completed",
+      task_id: "T-1",
+      run_id: "R-1",
+      payload: {
+        verdict: "approved",
+      },
+    });
+    expect(() => log.append(event)).toThrow("payload.verdict_uri");
   });
 });

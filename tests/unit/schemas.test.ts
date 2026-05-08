@@ -9,6 +9,10 @@ import {
   parseAgentProfile,
   eventEnvelopeSchema,
 } from "../../src/core/schemas.js";
+import {
+  WorkOrderV1Schema,
+  AgentProfileV1Schema,
+} from "../../src/core/schemas-v1.js";
 import { z } from "zod";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -127,8 +131,8 @@ describe("parseWorkOrder", () => {
     expect(result.project_id).toBe("p1");
   });
 
-  it("throws ZodError for invalid input", () => {
-    expect(() => parseWorkOrder({})).toThrow(z.ZodError);
+  it("throws for invalid input (empty object → missing schema_version)", () => {
+    expect(() => parseWorkOrder({})).toThrow("Unsupported schema_version");
   });
 });
 
@@ -207,8 +211,8 @@ describe("parseAgentProfile", () => {
     expect(result.agent_id).toBe("claude-local");
   });
 
-  it("throws ZodError for invalid input", () => {
-    expect(() => parseAgentProfile({})).toThrow(z.ZodError);
+  it("throws for invalid input (empty object → missing schema_version)", () => {
+    expect(() => parseAgentProfile({})).toThrow("Unsupported schema_version");
   });
 });
 
@@ -261,6 +265,74 @@ describe("ArtifactRefSchema", () => {
     expect(() =>
       ArtifactRefSchema.parse({ uri: "a://b", kind: "unknown" }),
     ).toThrow();
+  });
+});
+
+// ─── EventEnvelope ───────────────────────────────────────────────────────────
+
+describe("parseWorkOrder (discriminated dispatch)", () => {
+  it("routes workflow/v0 to v0 schema", () => {
+    const result = parseWorkOrder(validWorkOrder);
+    expect(result.schema_version).toBe("workflow/v0");
+    expect(result.task_id).toBe("T-test");
+  });
+
+  it("routes workflow/v1 to v1 schema", () => {
+    const result = parseWorkOrder({
+      schema_version: "workflow/v1",
+      task_id: "T-v1",
+      title: "A v1 task",
+      type: "code_change",
+      goal: "Do something.",
+      acceptance_criteria: ["Done."],
+      repo: { path: "/tmp/r" },
+      agent: { required_capabilities: ["code_change"], implementer_pool: ["a1"] },
+    });
+    expect(result.schema_version).toBe("workflow/v1");
+    expect(result.project_id).toBe("default");
+  });
+
+  it("rejects unsupported schema_version", () => {
+    expect(() =>
+      parseWorkOrder({ ...validWorkOrder, schema_version: "workflow/v99" }),
+    ).toThrow("Unsupported schema_version");
+  });
+
+  it("rejects missing schema_version", () => {
+    const { schema_version, ...rest } = validWorkOrder;
+    expect(() => parseWorkOrder(rest)).toThrow("Unsupported schema_version");
+  });
+});
+
+describe("parseAgentProfile (discriminated dispatch)", () => {
+  it("routes workflow/v0 to v0 schema", () => {
+    const result = parseAgentProfile(validAgentProfile);
+    expect(result.schema_version).toBe("workflow/v0");
+  });
+
+  it("routes workflow/v1 to v1 schema", () => {
+    const result = parseAgentProfile({
+      schema_version: "workflow/v1",
+      agent_id: "a1",
+      integration_mode: "official_cli",
+      command: { executable: "claude", args: ["-p"] },
+      capabilities: {
+        outer_supervised: true,
+        inner_tool_control: false,
+        kinds: ["code_change"],
+        roles: ["implementer"],
+      },
+    });
+    expect(result.schema_version).toBe("workflow/v1");
+    if (result.schema_version === "workflow/v1") {
+      expect(result.capabilities.roles).toEqual(["implementer"]);
+    }
+  });
+
+  it("rejects unsupported schema_version", () => {
+    expect(() =>
+      parseAgentProfile({ ...validAgentProfile, schema_version: "workflow/v99" }),
+    ).toThrow("Unsupported schema_version");
   });
 });
 

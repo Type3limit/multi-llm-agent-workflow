@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseWorkOrder, parseAgentProfile } from "../core/schemas.js";
-import type { ParsedWorkOrder, ParsedAgentProfile } from "../core/schemas.js";
+import type { ParsedWorkOrder, ParsedAgentProfile, WorkOrder, AgentProfile } from "../core/schemas.js";
 import { runWorkOrder, type RunWorkOrderResult } from "../core/orchestrator.js";
 import { parseSimpleYaml } from "./yaml-simple.js";
 
@@ -60,7 +60,18 @@ export function loadWorkOrder(filePath: string): ParsedWorkOrder {
   } catch {
     throw new Error(`Failed to parse WorkOrder JSON: ${filePath}`);
   }
-  return parseWorkOrder(raw);
+  const parsed = parseWorkOrder(raw);
+  return narrowToV0WorkOrder(parsed);
+}
+
+function narrowToV0WorkOrder(wo: WorkOrder): ParsedWorkOrder {
+  if (wo.schema_version !== "workflow/v0") {
+    throw new Error(
+      `WorkOrder schema_version "${wo.schema_version}" is not supported by the 'run' command. ` +
+      `Only "workflow/v0" is supported. For v1 WorkOrders, use 'agentflow batch' (coming in v1).`,
+    );
+  }
+  return wo;
 }
 
 export function loadAgentProfile(filePath: string): ParsedAgentProfile {
@@ -84,7 +95,18 @@ export function loadAgentProfile(filePath: string): ParsedAgentProfile {
     }
   }
 
-  return parseAgentProfile(raw);
+  const parsed = parseAgentProfile(raw);
+  return narrowToV0AgentProfile(parsed);
+}
+
+function narrowToV0AgentProfile(ap: AgentProfile): ParsedAgentProfile {
+  if (ap.schema_version !== "workflow/v0") {
+    throw new Error(
+      `AgentProfile schema_version "${ap.schema_version}" is not supported by the 'run' command. ` +
+      `Only "workflow/v0" is supported. For v1 AgentProfiles, use 'agentflow batch' (coming in v1).`,
+    );
+  }
+  return ap;
 }
 
 function summary(result: RunWorkOrderResult): string {

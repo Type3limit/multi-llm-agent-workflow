@@ -196,4 +196,45 @@ describe("LocalArtifactStore", () => {
       ).toThrow("empty string");
     });
   });
+
+  // ─── v1 artifact kinds ──────────────────────────────────────────────
+
+  describe("v1 artifact kinds", () => {
+    it("accepts review_verdict kind", () => {
+      const ref = store.saveText({
+        projectId: "default",
+        taskId: "T-v1",
+        runId: "R-v1",
+        kind: "review_verdict",
+        filename: "review_verdict.json",
+        content: '{"verdict":"approved"}',
+      });
+      expect(ref.kind).toBe("review_verdict");
+      expect(() => ArtifactRefSchema.parse(ref)).not.toThrow();
+    });
+
+    it("accepts handoff_packet kind", () => {
+      const ref = store.saveText({
+        projectId: "default",
+        taskId: "T-v1",
+        runId: "R-v1",
+        kind: "handoff_packet",
+        filename: "handoff.json",
+        content: '{}',
+      });
+      expect(ref.kind).toBe("handoff_packet");
+    });
+
+    it("accepts schedule_decision kind", () => {
+      const ref = store.saveText({
+        projectId: "default",
+        taskId: "T-v1",
+        runId: "R-v1",
+        kind: "schedule_decision",
+        filename: "decision.json",
+        content: '{"picked_agent_id":"a"}',
+      });
+      expect(ref.kind).toBe("schedule_decision");
+    });
+  });
 });

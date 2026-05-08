@@ -404,7 +404,12 @@ export async function runWorkOrderWithServices(args: {
       svc.runStore.updateStatus(runId, "failed", {
         ended_at: new Date().toISOString(),
       });
-      append("run.failed");
+      const reason = agentResult.timedOut
+        ? "agent_timed_out"
+        : agentResult.exitCode !== 0
+          ? "agent_nonzero_exit"
+          : "verification_failed";
+      append("run.failed", { reason });
     }
 
     return {
@@ -427,6 +432,7 @@ export async function runWorkOrderWithServices(args: {
     }
     try {
       append("run.failed", {
+        reason: "internal_error",
         error: err instanceof Error ? err.message : String(err),
       });
     } catch {

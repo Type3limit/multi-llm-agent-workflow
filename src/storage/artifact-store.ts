@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Database } from "./database.js";
-import type { ArtifactRef, ArtifactKind } from "../core/types.js";
+import type { ArtifactRef, ArtifactKindV1 } from "../core/types.js";
 import { generateArtifactId, sha256hex } from "../core/ids.js";
 
 interface Stmt {
@@ -13,7 +13,7 @@ export interface ArtifactStore {
     projectId: string;
     taskId: string;
     runId: string;
-    kind: ArtifactKind;
+    kind: ArtifactKindV1;
     filename: string;
     content: string;
     summary?: string;
@@ -23,7 +23,7 @@ export interface ArtifactStore {
     projectId: string;
     taskId: string;
     runId: string;
-    kind: ArtifactKind;
+    kind: ArtifactKindV1;
     sourcePath: string;
     filename: string;
     summary?: string;
@@ -77,7 +77,7 @@ export class LocalArtifactStore implements ArtifactStore {
     projectId: string;
     taskId: string;
     runId: string;
-    kind: ArtifactKind;
+    kind: ArtifactKindV1;
     filePath: string;
     checksum: string;
     summary?: string;
@@ -109,7 +109,7 @@ export class LocalArtifactStore implements ArtifactStore {
     projectId: string;
     taskId: string;
     runId: string;
-    kind: ArtifactKind;
+    kind: ArtifactKindV1;
     filename: string;
     content: string;
     summary?: string;
@@ -143,7 +143,7 @@ export class LocalArtifactStore implements ArtifactStore {
     projectId: string;
     taskId: string;
     runId: string;
-    kind: ArtifactKind;
+    kind: ArtifactKindV1;
     sourcePath: string;
     filename: string;
     summary?: string;
