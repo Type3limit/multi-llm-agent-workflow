@@ -6,7 +6,10 @@ import { migrate } from "../storage/migrations.js";
 import { SqliteEventLog } from "../storage/event-log.js";
 import { SqliteRunStore, type RunRecord } from "../storage/run-store.js";
 import { LocalArtifactStore } from "../storage/artifact-store.js";
-import { CliGitWorktreeManager } from "../workspace/git-worktree-manager.js";
+import {
+  GitWorktreeSandboxProvider,
+  type SandboxProvider,
+} from "../workspace/sandbox-provider.js";
 import { FileTaskCapsuleWriter } from "../workspace/task-capsule-writer.js";
 import { ChildProcessOfficialCliAdapter } from "../adapters/official-cli-adapter.js";
 import { ShellVerificationRunner } from "../verification/verification-runner.js";
@@ -28,7 +31,7 @@ interface OrchestratorServices {
   eventLog: SqliteEventLog;
   runStore: SqliteRunStore;
   artifactStore: LocalArtifactStore;
-  gitManager: CliGitWorktreeManager;
+  sandboxProvider: SandboxProvider;
   capsuleWriter: FileTaskCapsuleWriter;
   adapter: ChildProcessOfficialCliAdapter;
   verifier: ShellVerificationRunner;
@@ -39,7 +42,7 @@ function makeServices(db: Database, repoPath: string): OrchestratorServices {
     eventLog: new SqliteEventLog(db),
     runStore: new SqliteRunStore(db),
     artifactStore: new LocalArtifactStore(db, repoPath),
-    gitManager: new CliGitWorktreeManager(),
+    sandboxProvider: new GitWorktreeSandboxProvider(),
     capsuleWriter: new FileTaskCapsuleWriter(),
     adapter: new ChildProcessOfficialCliAdapter(),
     verifier: new ShellVerificationRunner(),
@@ -144,7 +147,7 @@ export async function runWorkOrderWithServices(args: {
     append("run.created");
 
     // 4. Prepare git worktree
-    const worktree = svc.gitManager.prepare({
+    const worktree = svc.sandboxProvider.prepareWorkspace({
       repoPath: wo.repo.path,
       baseRef: wo.repo.base_ref,
       taskId,
@@ -254,7 +257,9 @@ export async function runWorkOrderWithServices(args: {
     });
 
     // diff — always save, even if empty
-    const diffContent = svc.gitManager.diff(worktree.workspacePath);
+    const diffContent = svc.sandboxProvider.diff({
+      workspacePath: worktree.workspacePath,
+    });
     const diffArtifact = svc.artifactStore.saveText({
       projectId,
       taskId,

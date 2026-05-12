@@ -771,6 +771,22 @@ describe("assertV1PayloadFields", () => {
       ).not.toThrow();
     });
 
+    it("passes for diff_apply_failed handoff requests", () => {
+      expect(() =>
+        assertV1PayloadFields(
+          makeEvent({
+            event_type: "handoff.requested",
+            task_id: "T-1",
+            run_id: "R-1",
+            payload: {
+              handoff_packet_uri: "artifact://T-1/R-1/handoff_packet.json",
+              reason: "diff_apply_failed",
+            },
+          }),
+        ),
+      ).not.toThrow();
+    });
+
     it("rejects missing handoff_packet_uri", () => {
       expect(() =>
         assertV1PayloadFields(

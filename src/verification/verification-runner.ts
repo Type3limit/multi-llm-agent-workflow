@@ -2,6 +2,7 @@ import { spawn, execSync } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import { OperationAbortedError, throwIfAborted } from "../core/abort-error.js";
 
 export interface VerificationResult {
   passed: boolean;
@@ -19,6 +20,7 @@ export interface VerificationRunner {
     workspacePath: string;
     commands: string[];
     timeoutSeconds?: number;
+    signal?: AbortSignal;
   }): Promise<VerificationResult>;
 }
 
@@ -55,11 +57,14 @@ function runSingleCommand(
   env: NodeJS.ProcessEnv,
   timeoutSeconds: number,
   maxOutputBytes: number,
+  signal?: AbortSignal,
 ): Promise<VerificationResult["commandResults"][0]> {
+  throwIfAborted(signal);
   const startTime = Date.now();
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let timedOut = false;
+    let aborted = false;
 
     const child = spawn(command, {
       cwd,
@@ -68,8 +73,7 @@ function runSingleCommand(
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const killChildTree = (): void => {
       try {
         if (child.pid) {
           if (os.platform() === "win32") {
@@ -81,7 +85,22 @@ function runSingleCommand(
       } catch {
         // best effort
       }
+    };
+
+    const abortHandler = (): void => {
+      aborted = true;
+      killChildTree();
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChildTree();
     }, timeoutSeconds * 1000);
+
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    if (signal?.aborted) {
+      abortHandler();
+    }
 
     const outputBuf = new OutputTailBuffer(maxOutputBytes);
 
@@ -90,6 +109,11 @@ function runSingleCommand(
 
     child.on("error", () => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abortHandler);
+      if (aborted) {
+        reject(new OperationAbortedError());
+        return;
+      }
       resolve({
         command,
         exitCode: null,
@@ -101,6 +125,11 @@ function runSingleCommand(
 
     child.on("close", (exitCode) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abortHandler);
+      if (aborted) {
+        reject(new OperationAbortedError());
+        return;
+      }
       const wallTimeMs = Date.now() - startTime;
       let output = outputBuf.tailString();
 
@@ -124,7 +153,10 @@ export class ShellVerificationRunner implements VerificationRunner {
     workspacePath: string;
     commands: string[];
     timeoutSeconds?: number;
+    signal?: AbortSignal;
   }): Promise<VerificationResult> {
+    throwIfAborted(args.signal);
+
     const ws = path.resolve(args.workspacePath);
 
     let stat: fs.Stats;
@@ -147,12 +179,14 @@ export class ShellVerificationRunner implements VerificationRunner {
     const commandResults: VerificationResult["commandResults"] = [];
 
     for (const command of args.commands) {
+      throwIfAborted(args.signal);
       const result = await runSingleCommand(
         command,
         ws,
         env,
         timeoutSeconds,
         DEFAULT_MAX_OUTPUT_BYTES,
+        args.signal,
       );
       commandResults.push(result);
 

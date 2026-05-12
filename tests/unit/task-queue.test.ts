@@ -10,6 +10,7 @@ import type { QueueStore } from "../../src/storage/queue-store.js";
 import type { Database } from "../../src/storage/database.js";
 import { migrate } from "../../src/storage/migrations.js";
 import type { TaskQueueEntry } from "../../src/core/types.js";
+import type { ReviewContextRecord } from "../../src/core/types.js";
 import type { ParsedWorkOrderV1 } from "../../src/core/schemas-v1.js";
 import { parseWorkOrderV1 } from "../../src/core/schemas-v1.js";
 
@@ -37,6 +38,8 @@ function makeWorkOrder(overrides: Partial<Record<string, unknown>> = {}): Parsed
 class FakeQueueStore implements QueueStore {
   private entries: Map<string, TaskQueueEntry> = new Map();
   private workOrders: Map<string, string> = new Map();
+  private reviewContexts: Map<string, ReviewContextRecord> = new Map();
+  private handoffPacketUris: Map<string, string> = new Map();
   private order: string[] = [];
   private _now: () => Date;
 
@@ -110,6 +113,53 @@ class FakeQueueStore implements QueueStore {
     return this.entries.get(taskId);
   }
 
+  getWorkOrder(taskId: string): ParsedWorkOrderV1 | undefined {
+    const json = this.workOrders.get(taskId);
+    return json ? parseWorkOrderV1(JSON.parse(json)) : undefined;
+  }
+
+  addWorkOrderExcludeAgentIds(taskId: string, agentIds: string[]): ParsedWorkOrderV1 {
+    const existingJson = this.workOrders.get(taskId);
+    if (!existingJson) throw new Error(`TaskQueue entry not found: ${taskId}`);
+    const existing = parseWorkOrderV1(JSON.parse(existingJson));
+    const exclude_agent_ids = dedupeFirstSeen([
+      ...existing.agent.exclude_agent_ids,
+      ...agentIds,
+    ]);
+    const updated = parseWorkOrderV1({
+      ...existing,
+      agent: {
+        ...existing.agent,
+        exclude_agent_ids,
+      },
+    });
+    this.workOrders.set(taskId, JSON.stringify(updated));
+    return updated;
+  }
+
+  setReviewContext(taskId: string, context: ReviewContextRecord): void {
+    if (!this.entries.has(taskId)) throw new Error(`TaskQueue entry not found: ${taskId}`);
+    this.reviewContexts.set(taskId, structuredClone(context));
+  }
+
+  getReviewContext(taskId: string): ReviewContextRecord | undefined {
+    const context = this.reviewContexts.get(taskId);
+    return context ? structuredClone(context) : undefined;
+  }
+
+  setHandoffPacketUri(taskId: string, uri: string | undefined): void {
+    if (!this.entries.has(taskId)) throw new Error(`TaskQueue entry not found: ${taskId}`);
+    if (uri === undefined) {
+      this.handoffPacketUris.delete(taskId);
+      return;
+    }
+    this.handoffPacketUris.set(taskId, uri);
+  }
+
+  getHandoffPacketUri(taskId: string): string | undefined {
+    return this.handoffPacketUris.get(taskId);
+  }
+
   listAll(): TaskQueueEntry[] {
     return this.order.map((id) => this.entries.get(id)!);
   }
@@ -118,6 +168,17 @@ class FakeQueueStore implements QueueStore {
   getWorkOrderJson(taskId: string): string | undefined {
     return this.workOrders.get(taskId);
   }
+}
+
+function dedupeFirstSeen(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -245,6 +306,26 @@ describe("DefaultTaskQueue", () => {
     const now = Date.now();
     expect(expires).toBeGreaterThan(now + 350_000);
     expect(expires).toBeLessThan(now + 370_000);
+  });
+
+  it("claim() uses persisted WorkOrder lease for a fresh queue sharing the enqueuer store", () => {
+    const fixedDate = new Date("2026-02-01T12:00:00Z");
+    const fixedNow = () => fixedDate;
+    const store2 = new FakeQueueStore(fixedNow);
+    const enqueuerQueue = new DefaultTaskQueue({ store: store2, now: fixedNow });
+    const workerQueue = new DefaultTaskQueue({ store: store2, now: fixedNow });
+    const wo = makeWorkOrder({
+      task_id: "T-persisted-lease",
+      budget: { max_wall_time_minutes: 5 },
+    });
+
+    enqueuerQueue.enqueue({ workOrder: wo });
+    const claimed = workerQueue.claim("fresh-worker");
+
+    expect(claimed).not.toBeNull();
+    expect(claimed!.task_id).toBe("T-persisted-lease");
+    expect(store2.lastClaimLeaseDurationSec).toBe(360);
+    expect(claimed!.lease_expires_at).toBe("2026-02-01T12:06:00.000Z");
   });
 
   it("claim() falls back to 60 minutes for unknown tasks", () => {
@@ -520,6 +601,69 @@ describe("DefaultTaskQueue", () => {
 
   it("get() returns undefined for unknown task", () => {
     expect(queue.get("nonexistent")).toBeUndefined();
+  });
+
+  it("getWorkOrder() loads a parsed WorkOrder from the store when not cached", () => {
+    const wo = makeWorkOrder({ task_id: "T-direct" });
+    store.insert(
+      {
+        task_id: "T-direct",
+        project_id: "default",
+        status: "queued",
+        next_role: "implementer",
+        current_owner_run_id: null,
+        lease_expires_at: null,
+        attempts: 0,
+        enqueued_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      JSON.stringify(wo),
+    );
+
+    const loaded = queue.getWorkOrder("T-direct");
+
+    expect(loaded?.task_id).toBe("T-direct");
+    expect(loaded?.schema_version).toBe("workflow/v1");
+  });
+
+  it("addWorkOrderExcludeAgentIds() grows excludes in first-seen order", () => {
+    const wo = makeWorkOrder({
+      task_id: "T-excludes",
+      agent: {
+        required_capabilities: ["code_change"],
+        implementer_pool: ["agent-a", "agent-b", "agent-c"],
+        exclude_agent_ids: ["agent-a"],
+      },
+    });
+    queue.enqueue({ workOrder: wo });
+
+    const updated = queue.addWorkOrderExcludeAgentIds("T-excludes", [
+      "agent-b",
+      "agent-a",
+      "agent-c",
+    ]);
+
+    expect(updated.agent.exclude_agent_ids).toEqual(["agent-a", "agent-b", "agent-c"]);
+    expect(queue.getWorkOrder("T-excludes")?.agent.exclude_agent_ids).toEqual([
+      "agent-a",
+      "agent-b",
+      "agent-c",
+    ]);
+  });
+
+  it("setReviewContext()/getReviewContext() delegates persisted reviewer inputs", () => {
+    const wo = makeWorkOrder({ task_id: "T-review-context" });
+    queue.enqueue({ workOrder: wo });
+
+    const context: ReviewContextRecord = {
+      implementer_run_id: "run-impl",
+      implementer_agent_id: "agent-a",
+      diff_artifact_uri: "artifact://T-review-context/run-impl/diff.patch",
+      final_report_uri: "artifact://T-review-context/run-impl/final_report.md",
+    };
+    queue.setReviewContext("T-review-context", context);
+
+    expect(queue.getReviewContext("T-review-context")).toEqual(context);
   });
 
   // ─── listTerminal ──────────────────────────────────────────────────────

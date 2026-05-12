@@ -27,6 +27,7 @@ const EXPECTED_TABLES: Record<string, string[]> = {
     "task_id", "project_id", "status", "next_role",
     "current_owner_run_id", "lease_expires_at",
     "attempts", "enqueued_at", "updated_at", "workorder_json",
+    "review_context_json", "handoff_packet_uri",
   ],
   agent_metrics: [
     "id", "agent_id", "run_id", "success", "wall_time_ms",

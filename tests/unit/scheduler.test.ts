@@ -166,6 +166,88 @@ describe("DefaultScheduler", () => {
     expect(d.picked_agent_id).toBe("a-agent");
   });
 
+  it("excludes implementer candidates outside a non-empty implementer_pool", () => {
+    const registry = new FakeRegistry();
+    registry.add(makeEntry({
+      profile: { agent_id: "aaa-not-in-pool" } as AgentRegistryEntry["profile"],
+    }));
+    registry.add(makeEntry({
+      profile: { agent_id: "allowed-z" } as AgentRegistryEntry["profile"],
+    }));
+    const scheduler = new DefaultScheduler();
+
+    const d = scheduler.decide({
+      workOrder: makeWorkOrder({
+        agent: {
+          required_capabilities: ["code_change"],
+          implementer_pool: ["allowed-z"],
+          reviewer_pool: [],
+          exclude_agent_ids: [],
+        },
+      }),
+      role: "implementer",
+      excludeAgentIds: [],
+      registry,
+      budget: makeBudget(),
+    });
+
+    expect(d.picked_agent_id).toBe("allowed-z");
+    const outsidePool = d.candidate_scores.find((c) => c.agent_id === "aaa-not-in-pool");
+    expect(outsidePool).toBeDefined();
+    expect(outsidePool!.excluded).toBe(true);
+    expect(outsidePool!.excluded_reason).toBe("not_in_implementer_pool");
+  });
+
+  it("excludes reviewer candidates outside a non-empty reviewer_pool and still excludes the most recent implementer", () => {
+    const registry = new FakeRegistry();
+    registry.add(makeEntry({
+      profile: {
+        agent_id: "aaa-not-in-pool",
+        capabilities: { outer_supervised: true, inner_tool_control: false, kinds: ["code_change"], roles: ["reviewer"] },
+      } as AgentRegistryEntry["profile"],
+    }));
+    registry.add(makeEntry({
+      profile: {
+        agent_id: "recent-implementer",
+        capabilities: { outer_supervised: true, inner_tool_control: false, kinds: ["code_change"], roles: ["implementer", "reviewer"] },
+      } as AgentRegistryEntry["profile"],
+    }));
+    registry.add(makeEntry({
+      profile: {
+        agent_id: "reviewer-z",
+        capabilities: { outer_supervised: true, inner_tool_control: false, kinds: ["code_change"], roles: ["reviewer"] },
+      } as AgentRegistryEntry["profile"],
+    }));
+    const scheduler = new DefaultScheduler();
+
+    const d = scheduler.decide({
+      workOrder: makeWorkOrder({
+        agent: {
+          required_capabilities: ["code_change"],
+          implementer_pool: [],
+          reviewer_pool: ["recent-implementer", "reviewer-z"],
+          exclude_agent_ids: [],
+        },
+      }),
+      role: "reviewer",
+      excludeAgentIds: [],
+      registry,
+      budget: makeBudget(),
+      mostRecentImplementerAgentId: "recent-implementer",
+    });
+
+    expect(d.picked_agent_id).toBe("reviewer-z");
+    const outsidePool = d.candidate_scores.find((c) => c.agent_id === "aaa-not-in-pool");
+    expect(outsidePool).toBeDefined();
+    expect(outsidePool!.excluded).toBe(true);
+    expect(outsidePool!.excluded_reason).toBe("not_in_reviewer_pool");
+
+    const recentImplementer = d.candidate_scores.find((c) => c.agent_id === "recent-implementer");
+    expect(recentImplementer).toBeDefined();
+    expect(recentImplementer!.excluded).toBe(true);
+    expect(recentImplementer!.excluded_reason).toBe("excluded_agent");
+  });
+
   it("capability mismatch agent in candidate_scores with excluded_reason", () => {
     const registry = new FakeRegistry();
     registry.add(makeEntry({
@@ -260,6 +342,29 @@ describe("DefaultScheduler", () => {
     expect(cs!.excluded_reason).toBe("quota_exhausted");
 
     expect(d.picked_agent_id).toBe("healthy");
+  });
+
+  it("scores low quota health as 0.5 and keeps the agent eligible", () => {
+    const registry = new FakeRegistry();
+    registry.add(makeEntry({
+      profile: { agent_id: "low-agent" } as AgentRegistryEntry["profile"],
+      quota_health: "low",
+    }));
+    const scheduler = new DefaultScheduler();
+
+    const d = scheduler.decide({
+      workOrder: makeWorkOrder(),
+      role: "implementer",
+      excludeAgentIds: [],
+      registry,
+      budget: makeBudget(),
+    });
+
+    const cs = d.candidate_scores.find((c) => c.agent_id === "low-agent");
+    expect(d.picked_agent_id).toBe("low-agent");
+    expect(cs).toBeDefined();
+    expect(cs!.excluded).toBeUndefined();
+    expect(cs!.breakdown.quota_health).toBe(0.5);
   });
 
   it("refusal: budget exhausted → task_budget_exhausted", () => {

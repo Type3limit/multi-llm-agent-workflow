@@ -229,6 +229,7 @@ export function assertV1PayloadFields(event: EventEnvelope<EventPayload>): void 
       const validReasons = [
         "verification_failed",
         "review_changes_requested",
+        "diff_apply_failed",
         "review_rejected",
         "agent_timed_out",
         "agent_nonzero_exit",

@@ -69,7 +69,9 @@ create table if not exists task_queue (
   attempts integer not null default 0,
   enqueued_at text not null,
   updated_at text not null,
-  workorder_json text not null
+  workorder_json text not null,
+  review_context_json text,
+  handoff_packet_uri text
 );
 
 create index if not exists task_queue_status_lease_idx
@@ -117,8 +119,18 @@ function addAgentRunsColumns(db: Database): void {
   }
 }
 
+function addTaskQueueColumns(db: Database): void {
+  if (!columnExists(db, "task_queue", "review_context_json")) {
+    db.exec("alter table task_queue add column review_context_json text");
+  }
+  if (!columnExists(db, "task_queue", "handoff_packet_uri")) {
+    db.exec("alter table task_queue add column handoff_packet_uri text");
+  }
+}
+
 export function migrate(database: Database): void {
   database.exec(SCHEMA);
   database.exec(V1_SCHEMA);
   addAgentRunsColumns(database);
+  addTaskQueueColumns(database);
 }

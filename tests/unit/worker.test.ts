@@ -96,6 +96,26 @@ class FakeQueue implements TaskQueue {
     return this.entries.find((entry) => entry.task_id === taskId);
   }
 
+  getWorkOrder(taskId: string): ParsedWorkOrderV1 | undefined {
+    return makeWorkOrder(taskId);
+  }
+
+  addWorkOrderExcludeAgentIds(taskId: string): ParsedWorkOrderV1 {
+    return makeWorkOrder(taskId);
+  }
+
+  setReviewContext(): void {}
+
+  getReviewContext(): undefined {
+    return undefined;
+  }
+
+  setHandoffPacketUri(): void {}
+
+  getHandoffPacketUri(): undefined {
+    return undefined;
+  }
+
   listTerminal(): TaskQueueEntry[] {
     return this.entries.filter((entry) =>
       ["accepted", "failed", "awaiting_human"].includes(entry.status),

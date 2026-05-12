@@ -196,4 +196,92 @@ describe("SqliteRunStore", () => {
     expect(r.parent_run_id).toBe("R-parent");
     expect(r.handoff_packet_uri).toBe("uri://handoff");
   });
+
+  it("listCleanupCandidates returns accepted and failed v1 runs by task_id then run insertion order", () => {
+    insertTaskQueueRow(db, { taskId: "T-z", status: "accepted", index: 0 });
+    insertTaskQueueRow(db, { taskId: "T-a", status: "accepted", index: 1 });
+    insertTaskQueueRow(db, { taskId: "T-f", status: "failed", index: 2 });
+    insertTaskQueueRow(db, { taskId: "T-human", status: "awaiting_human", index: 3 });
+
+    store.create(makeRecord({
+      id: "R-z-1",
+      task_id: "T-z",
+      role: "implementer",
+      workspace_path: "/ws/z-1",
+    }));
+    store.create(makeRecord({
+      id: "R-a-1",
+      task_id: "T-a",
+      role: "implementer",
+      workspace_path: "/ws/a-1",
+    }));
+    store.create(makeRecord({
+      id: "R-a-2",
+      task_id: "T-a",
+      role: "reviewer",
+    }));
+    store.create(makeRecord({
+      id: "R-f-1",
+      task_id: "T-f",
+      status: "failed",
+      role: "implementer",
+      workspace_path: "/ws/f-1",
+    }));
+    store.create(makeRecord({
+      id: "R-human-1",
+      task_id: "T-human",
+      role: "reviewer",
+      workspace_path: "/ws/human-1",
+    }));
+
+    const candidates = store.listCleanupCandidates([
+      "T-z",
+      "T-human",
+      "T-a",
+      "T-f",
+    ]);
+
+    expect(candidates.map((record) => record.run_id)).toEqual([
+      "R-a-1",
+      "R-a-2",
+      "R-f-1",
+      "R-z-1",
+    ]);
+    expect(candidates.map((record) => record.task_id)).toEqual([
+      "T-a",
+      "T-a",
+      "T-f",
+      "T-z",
+    ]);
+    expect(candidates[1]).toMatchObject({
+      run_id: "R-a-2",
+      role: "reviewer",
+    });
+    expect(candidates[1].workspace_path).toBeUndefined();
+  });
 });
+
+function insertTaskQueueRow(
+  db: Database,
+  args: {
+    taskId: string;
+    status: "accepted" | "failed" | "awaiting_human";
+    index: number;
+  },
+): void {
+  const ts = `2026-01-01T00:00:${String(args.index).padStart(2, "0")}.000Z`;
+  db.prepare(`
+    insert into task_queue (
+      task_id, project_id, status, next_role,
+      current_owner_run_id, lease_expires_at,
+      attempts, enqueued_at, updated_at, workorder_json
+    ) values (
+      @task_id, 'default', @status, 'implementer',
+      null, null, 1, @ts, @ts, '{}'
+    )
+  `).run({
+    task_id: args.taskId,
+    status: args.status,
+    ts,
+  });
+}

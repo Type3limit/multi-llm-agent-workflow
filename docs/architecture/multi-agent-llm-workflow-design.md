@@ -16,6 +16,23 @@
 
 一句话：**用“结构化任务 + 共享状态 + 可引用产物”代替“多个模型互相聊天”。**
 
+### 1.1 四层解耦对齐
+
+`docs/architecture/four-layer-decoupling.md` 记录了一个更长期的参考方向：Agent / Sandbox、Coordinator、Session、SessionStore 四层逐步解耦。这个方向与本文档兼容，但不要把它理解成 MVP 或 v1 的范围。
+
+agentflow 的落地顺序应当是：
+
+1. **先收口本地编排内核**：v1 先把 Scheduler、Reviewer、WorkerPool、Budget、Handoff、EventLog、ArtifactStore 跑通。
+2. **再抽出 Sandbox seam**：v1.x Phase 1 已把当前 `GitWorktreeManager` 行为提升为 `SandboxProvider` 的第一个 adapter，后续才接 Docker / micro-VM。
+3. **再做轻量 SessionSnapshot**：v1.x Phase 2 已把现有 run/event/artifact/handoff 数据暴露成只读聚合契约。
+4. **再做 file-state-only fork-from-snapshot**：v1.x Phase 3 已支持从 snapshot base evidence 加一个持久化 diff artifact 重建 fresh worktree，并通过 `SandboxProvider` 应用 patch；不恢复模型内部对话状态。
+5. **最后引入 Coordinator agent**：Planner / Coordinator agent 第一版只负责把高层目标拆成多个独立 WorkOrder，形成扁平 fan-out；执行仍然走 Scheduler + Budget + WorkerPool。
+6. **SessionStore 后置**：先用 SQLite 验证 snapshot 接口和 file-state reconstruction 语义，再考虑 Redis/KV 等部署形态。
+
+这条路线的原则是：**先让每个 seam 有真实压力，再为它增加 adapter 或更强实现**。不要因为远期架构里有一个名字，就提前铺一个没有使用者的浅模块。
+
+关键闸门：v1 的 Remaining 项、fake-agent approve、changes_requested/requeue、parallel batch 三个 e2e 场景全部通过后，才进入 `SandboxProvider`。v1.x Phase 1 已通过这个闸门，但只落地保持行为不变的 git worktree adapter，避免把 Docker / micro-VM 等新语义混进第一步 seam。
+
 ## 2. 推荐架构
 
 ```mermaid
@@ -2069,11 +2086,15 @@ single official CLI Agent, one-shot
 
 之后的扩展顺序由现实反馈驱动：
 
-- 加第二个 Agent → 验证 Adapter 抽象。
-- 加失败任务 → 验证 failure taxonomy。
-- 跑两个并发任务 → 验证 worktree 隔离和 Scheduler v1。
-- 跑真实 bug 修复 → 验证 Acceptance Verifier。
-- 接入 Dashboard → 验证 Event Log 和 Artifact Store 是否足够可观测。
+- 加第二个 Agent -> 验证 Adapter 抽象。
+- 加失败任务 -> 验证 failure taxonomy。
+- 跑两个并发任务 -> 验证 worktree 隔离和 Scheduler v1。
+- 收口 v1 Worker/Batch -> 验证本地编排内核。
+- 抽出 `SandboxProvider` -> v1.x Phase 1 已完成 behavior-preserving git worktree seam；下一步只有在真实需求出现时才接第二个 adapter。
+- 做 `SessionSnapshot` -> v1.x Phase 2 已完成 read-only 聚合契约；v1.x Phase 3 已验证从 snapshot base evidence 加 selected diff artifact 重建 fresh worktree。artifact refs 和 handoff 仍是审计/交接证据，不等于模型会话恢复。
+- 引入 Coordinator agent -> 先验证由 LLM 规划扁平 fan-out WorkOrders 是否真能减少人工编排。
+- 跑真实 bug 修复 -> 验证 Acceptance Verifier。
+- 接入 Dashboard -> 验证 Event Log 和 Artifact Store 是否足够可观测。
 
 原则：按“真实切片需要”兑现设计章节，而不是按“文档已经写了”铺满脚手架。
 
@@ -2088,23 +2109,28 @@ single official CLI Agent, one-shot
 3. **Run Manifest / run_id**：task 表示目标，run 表示一次具体执行尝试；所有事件、产物、费用、取消和清理都挂 run_id。
 4. **Event Log + Artifact Store**：状态可回放，产物可引用，失败可复盘。
 5. **凭据和账号隔离**：每个 Agent profile 有独立 credential/config/cache 边界。
+6. **v1 本地编排内核收口**：Worker outcome translation、Batch CLI、Reviewer flow、Budget/Handoff/Metrics 必须先闭环，否则上层 Session / Coordinator 都会放大不确定性。
 
 **第二层：没有它系统会浪费钱或假完成**
 
-6. **结构化 Work Order + Context Packet**：目标、边界、预算、验收标准和最小上下文都结构化。
-7. **Agent Registry + CostProfile + QuotaProfile**：把能力、成本、额度抽象出来，避免绑定某个模型。
-8. **Verification Gate + Acceptance Evidence**：先跑确定性检查，再用证据确认验收标准真的满足。
-9. **Artifact 安全扫描**：Agent 输出也可能污染后续输入，至少要有指令注入扫描和 secret leak 扫描。
-10. **Adapter Contract Tests**：官方 CLI/API 版本漂移不可避免，接入层必须先有合同测试。
-11. **Context Overflow 上限和 Replan 依赖失效**：失败边界要能收敛，不能无限重试或沿用废弃产物。
+7. **结构化 Work Order + Context Packet**：目标、边界、预算、验收标准和最小上下文都结构化。
+8. **Agent Registry + CostProfile + QuotaProfile**：把能力、成本、额度抽象出来，避免绑定某个模型。
+9. **Verification Gate + Acceptance Evidence**：先跑确定性检查，再用证据确认验收标准真的满足。
+10. **SandboxProvider seam**：当前 worktree 行为已经包成可替换 interface；等有第二个 adapter 时再接 Docker / micro-VM。
+11. **SessionSnapshot + file-state reconstruction**：作为现有 run/event/artifact/handoff 的只读聚合契约，先解决"从哪里继续"；v1.x Phase 3 已用 snapshot base evidence + selected diff artifact 重建 fresh worktree，long-running session resume 另行设计。
+12. **Artifact 安全扫描**：Agent 输出也可能污染后续输入，至少要有指令注入扫描和 secret leak 扫描。
+13. **Adapter Contract Tests**：官方 CLI/API 版本漂移不可避免，接入层必须先有合同测试。
+14. **Context Overflow 上限和 Replan 依赖失效**：失败边界要能收敛，不能无限重试或沿用废弃产物。
 
 **第三层：系统成熟后再增强**
 
-12. **Prompt Quality Auto-Rollback**：Prompt 当作代码后，也要能自动止血。
-13. **Handoff Quality Gate 和 partial diff 接力**：先保留 run snapshot，自动接力放到系统稳定后。
-14. **Adaptive Routing / Agent Reputation**：有足够历史数据后再自动调权重。
-15. **Workflow Canary / Red-Team Tests**：持续验证全链路和 prompt injection 防线。
-16. **Speculative Execution / Adversarial Review**：质量优先模式下再启用，避免默认双倍成本。
+15. **Coordinator / Planner agent**：当用户开始提交明显可拆解的高层目标时，先让 LLM 生成扁平 fan-out WorkOrders；执行仍走 Scheduler。真 DAG 需要独立 ADR。
+16. **Prompt Quality Auto-Rollback**：Prompt 当作代码后，也要能自动止血。
+17. **Handoff Quality Gate 和 partial diff 接力**：先保留 run snapshot，自动接力放到系统稳定后。
+18. **Adaptive Routing / Agent Reputation**：有足够历史数据后再自动调权重。
+19. **Workflow Canary / Red-Team Tests**：持续验证全链路和 prompt injection 防线。
+20. **SessionStore / 外部 KV**：SQLite SessionSnapshot 跑稳后，再外置到 Redis/KV。
+21. **Speculative Execution / Adversarial Review**：质量优先模式下再启用，避免默认双倍成本。
 
 ## 20. 总结
 

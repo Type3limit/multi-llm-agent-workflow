@@ -5,8 +5,10 @@ import * as os from "node:os";
 import SqliteDatabase from "better-sqlite3";
 import { migrate } from "../../src/storage/migrations.js";
 import { SqliteMetricsStore } from "../../src/storage/metrics-store.js";
+import { SqliteEventLog } from "../../src/storage/event-log.js";
 import { SqliteAgentRegistry } from "../../src/scheduling/agent-registry.js";
 import type { AgentRegistryEntry } from "../../src/core/types.js";
+import type { Database } from "../../src/storage/database.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -74,17 +76,20 @@ function toSimpleYaml(obj: Record<string, unknown>, indent = 0): string {
 
 describe("SqliteAgentRegistry", () => {
   let tmpDir: string;
+  let db: Database;
   let registry: SqliteAgentRegistry;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-registry-test-"));
-    const db = new SqliteDatabase(":memory:");
+    db = new SqliteDatabase(":memory:");
     migrate(db);
     const metricsStore = new SqliteMetricsStore(db);
-    registry = new SqliteAgentRegistry(metricsStore, 50);
+    const eventLog = new SqliteEventLog(db);
+    registry = new SqliteAgentRegistry(metricsStore, 50, eventLog);
   });
 
   afterEach(() => {
+    db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -442,6 +447,86 @@ describe("SqliteAgentRegistry", () => {
     ).toThrow("Agent not found in registry");
   });
 
+  it("recordOutcome marks provider_rate_limited agents low and emits quota.low once", () => {
+    const p = writeFile("a.json", makeJsonProfile({ agent_id: "agent-a" }));
+    registry.load({ sources: [p] });
+
+    registry.recordOutcome({
+      agentId: "agent-a",
+      runId: "run-rate-1",
+      success: false,
+      wallTimeMs: 100,
+      failureReason: "provider_rate_limited",
+    });
+    registry.recordOutcome({
+      agentId: "agent-a",
+      runId: "run-rate-2",
+      success: false,
+      wallTimeMs: 100,
+      failureReason: "provider_rate_limited",
+    });
+
+    expect(registry.get("agent-a")!.quota_health).toBe("low");
+    const events = quotaEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0].event_type).toBe("quota.low");
+    expect(events[0].agent_id).toBe("agent-a");
+    expect(JSON.parse(events[0].payload_json)).toMatchObject({
+      scope: "agent",
+      agent_id: "agent-a",
+      reason: "provider_rate_limited",
+    });
+  });
+
+  it.each([
+    "provider_quota_exhausted",
+    "provider_auth_failed",
+  ] as const)("recordOutcome marks %s agents exhausted and emits quota.exhausted once", (failureReason) => {
+    const p = writeFile("a.json", makeJsonProfile({ agent_id: "agent-a" }));
+    registry.load({ sources: [p] });
+
+    registry.recordOutcome({
+      agentId: "agent-a",
+      runId: "run-exhausted-1",
+      success: false,
+      wallTimeMs: 100,
+      failureReason,
+    });
+    registry.recordOutcome({
+      agentId: "agent-a",
+      runId: "run-exhausted-2",
+      success: false,
+      wallTimeMs: 100,
+      failureReason,
+    });
+
+    expect(registry.get("agent-a")!.quota_health).toBe("exhausted");
+    const events = quotaEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0].event_type).toBe("quota.exhausted");
+    expect(JSON.parse(events[0].payload_json)).toMatchObject({
+      scope: "agent",
+      agent_id: "agent-a",
+      reason: failureReason,
+    });
+  });
+
+  it("recordOutcome does not change quota health for ordinary failures", () => {
+    const p = writeFile("a.json", makeJsonProfile({ agent_id: "agent-a" }));
+    registry.load({ sources: [p] });
+
+    registry.recordOutcome({
+      agentId: "agent-a",
+      runId: "run-nonzero",
+      success: false,
+      wallTimeMs: 100,
+      failureReason: "agent_nonzero_exit",
+    });
+
+    expect(registry.get("agent-a")!.quota_health).toBe("healthy");
+    expect(quotaEvents()).toHaveLength(0);
+  });
+
   // ─── refreshQuotaHealth ──────────────────────────────────────────────
 
   it("refreshQuotaHealth keeps healthy agents healthy", () => {
@@ -468,4 +553,20 @@ describe("SqliteAgentRegistry", () => {
       registry.load({ sources: [path.join(tmpDir, "v1.json"), path.join(tmpDir, "v0.json")] }),
     ).toThrow("workflow/v0");
   });
+
+  function quotaEvents(): Array<{
+    event_type: string;
+    agent_id: string | null;
+    payload_json: string;
+  }> {
+    return db
+      .prepare(
+        "select event_type, agent_id, payload_json from task_events where event_type in ('quota.low', 'quota.exhausted') order by rowid asc",
+      )
+      .all() as Array<{
+      event_type: string;
+      agent_id: string | null;
+      payload_json: string;
+    }>;
+  }
 });

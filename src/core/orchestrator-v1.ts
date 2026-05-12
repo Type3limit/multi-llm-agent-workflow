@@ -1,29 +1,38 @@
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Database } from "../storage/database.js";
 import type { EventLog } from "../storage/event-log.js";
 import type { RunStore } from "../storage/run-store.js";
 import type { ArtifactStore } from "../storage/artifact-store.js";
-import type { GitWorktreeManager, PreparedWorktree } from "../workspace/git-worktree-manager.js";
+import type {
+  PreparedSandboxWorkspace,
+  SandboxProvider,
+} from "../workspace/sandbox-provider.js";
 import type { TaskCapsuleWriter, TaskCapsuleWriteResult } from "../workspace/task-capsule-writer.js";
 import type { ReviewBriefWriter, ReviewBriefWriteResult } from "../workspace/review-brief-writer.js";
+import { classifyOfficialCliFailure } from "../adapters/official-cli-adapter.js";
 import type { OfficialCliAdapter, AgentProcessResult } from "../adapters/official-cli-adapter.js";
 import type { VerificationRunner, VerificationResult } from "../verification/verification-runner.js";
 import { parseReviewVerdict, type ReviewVerdictParseResult } from "../adapters/review-verdict-parser.js";
+import { isOperationAbortedError, throwIfAborted } from "./abort-error.js";
 import type { ParsedAgentProfileV1, ParsedWorkOrderV1 } from "./schemas-v1.js";
 import type {
   ArtifactRef,
   EventEnvelope,
+  HandoffPacket,
   RunManifestV1,
   ScheduleDecision,
   TaskQueueEntry,
 } from "./types.js";
+import type { HandoffManager } from "../scheduling/handoff-manager.js";
 import { generateEventId, generateRunId, sha256hex } from "./ids.js";
 
 export type ImplementerFailureReason =
   | "agent_nonzero_exit"
   | "agent_timed_out"
+  | "provider_quota_exhausted"
+  | "provider_rate_limited"
+  | "provider_auth_failed"
   | "verification_failed"
   | "spawn_failed"
   | "internal_error";
@@ -33,6 +42,9 @@ export type ReviewerUnusableReason =
   | "diff_apply_failed"
   | "agent_nonzero_exit"
   | "agent_timed_out"
+  | "provider_quota_exhausted"
+  | "provider_rate_limited"
+  | "provider_auth_failed"
   | "spawn_failed"
   | "internal_error";
 
@@ -80,18 +92,13 @@ export interface V1RunTaskServices {
   eventLog: EventLog;
   runStore: RunStore;
   artifactStore: ArtifactStore;
-  gitManager: GitWorktreeManager;
+  sandboxProvider: SandboxProvider;
   taskCapsuleWriter: TaskCapsuleWriter;
   reviewBriefWriter: ReviewBriefWriter;
   adapter: OfficialCliAdapter;
   verifier: VerificationRunner;
+  handoffManager?: Pick<HandoffManager, "attachToBrief">;
   reviewVerdictParser?: typeof parseReviewVerdict;
-  applyDiffToWorkspace?: (args: {
-    workspacePath: string;
-    diffText: string;
-  }) =>
-    | { ok: true; stdout: string; stderr: string }
-    | { ok: false; stdout: string; stderr: string };
   now?: () => Date;
 }
 
@@ -101,7 +108,7 @@ interface RunContext {
   projectId: string;
   role: "implementer" | "reviewer";
   startedAt: string;
-  worktree: PreparedWorktree;
+  worktree: PreparedSandboxWorkspace;
   manifest: RunManifestV1;
   runManifestRef: string;
 }
@@ -241,7 +248,7 @@ function buildRunManifest(args: {
   agentProfile: ParsedAgentProfileV1;
   runId: string;
   role: "implementer" | "reviewer";
-  worktree: PreparedWorktree;
+  worktree: PreparedSandboxWorkspace;
   startedAt: string;
   parentRunId?: string;
   handoffPacketUri?: string;
@@ -268,31 +275,11 @@ function buildRunManifest(args: {
   };
 }
 
-function defaultApplyDiffToWorkspace(args: {
-  workspacePath: string;
-  diffText: string;
-}): { ok: true; stdout: string; stderr: string } | { ok: false; stdout: string; stderr: string } {
-  const result = spawnSync("git", ["apply", "--3way", "--whitespace=nowarn", "-"], {
-    cwd: args.workspacePath,
-    input: args.diffText,
-    encoding: "utf-8",
-  });
-
-  return {
-    ok: result.status === 0,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-  };
-}
-
-function agentFailureReason(result: AgentProcessResult): "agent_timed_out" | "agent_nonzero_exit" | undefined {
-  if (result.timedOut) {
-    return "agent_timed_out";
-  }
-  if (result.exitCode !== 0) {
-    return "agent_nonzero_exit";
-  }
-  return undefined;
+function agentFailureReason(
+  agentProfile: ParsedAgentProfileV1,
+  result: AgentProcessResult,
+): Exclude<ImplementerFailureReason, "verification_failed" | "spawn_failed" | "internal_error"> | undefined {
+  return classifyOfficialCliFailure({ agentProfile, result });
 }
 
 function verificationOutput(result: VerificationResult): string {
@@ -350,7 +337,7 @@ async function createRunContext(args: {
   });
 
   try {
-    const worktree = services.gitManager.prepare({
+    const worktree = services.sandboxProvider.prepareWorkspace({
       repoPath: workOrder.repo.path,
       baseRef: workOrder.repo.base_ref,
       taskId,
@@ -477,22 +464,48 @@ function finishRun(args: {
   });
 }
 
+function cancelInterruptedRun(args: {
+  services: V1RunTaskServices;
+  context: RunContext;
+}): void {
+  const run = args.services.runStore.get(args.context.runId);
+  if (!run || (run.status !== "preparing" && run.status !== "running")) {
+    return;
+  }
+
+  args.services.runStore.updateStatus(args.context.runId, "cancelled", {
+    ended_at: nowIso(args.services),
+  });
+}
+
 async function runImplementer(args: {
   context: RunContext;
   workOrder: ParsedWorkOrderV1;
   agentProfile: ParsedAgentProfileV1;
   services: V1RunTaskServices;
+  handoffPacket?: HandoffPacket;
+  signal?: AbortSignal;
 }): Promise<RunOutcome> {
   const { context, workOrder, agentProfile, services } = args;
   const artifacts: PublishedArtifacts = {};
 
   let capsule: TaskCapsuleWriteResult | undefined;
   try {
+    throwIfAborted(args.signal);
     capsule = services.taskCapsuleWriter.write({
       workspacePath: context.worktree.workspacePath,
       workOrder,
       runManifest: context.manifest,
     });
+    if (context.manifest.handoff_packet_uri && args.handoffPacket) {
+      if (!services.handoffManager) {
+        throw new Error("HandoffManager service is required to attach a handoff packet.");
+      }
+      services.handoffManager.attachToBrief({
+        workspacePath: context.worktree.workspacePath,
+        packet: args.handoffPacket,
+      });
+    }
 
     emitAgentSpawned({ services, context, agentId: agentProfile.agent_id });
 
@@ -507,8 +520,12 @@ async function runImplementer(args: {
         workspacePath: context.worktree.workspacePath,
         promptFile: capsule.promptPath,
         timeoutSeconds,
+        signal: args.signal,
       });
-    } catch {
+    } catch (error) {
+      if (isOperationAbortedError(error)) {
+        throw error;
+      }
       finishRun({ services, context, agentId: agentProfile.agent_id, status: "failed", reason: "spawn_failed" });
       return {
         kind: "implementer_failed",
@@ -547,7 +564,9 @@ async function runImplementer(args: {
       agentId: agentProfile.agent_id,
       kind: "diff",
       filename: "diff.patch",
-      content: services.gitManager.diff(context.worktree.workspacePath),
+      content: services.sandboxProvider.diff({
+        workspacePath: context.worktree.workspacePath,
+      }),
       summary: "Git diff of agent changes",
     });
 
@@ -585,7 +604,7 @@ async function runImplementer(args: {
       summary: "Task capsule location",
     });
 
-    const agentReason = agentFailureReason(agentResult);
+    const agentReason = agentFailureReason(agentProfile, agentResult);
     if (agentReason) {
       finishRun({ services, context, agentId: agentProfile.agent_id, status: "failed", reason: agentReason });
       return {
@@ -612,6 +631,7 @@ async function runImplementer(args: {
         workspacePath: context.worktree.workspacePath,
         commands: workOrder.verification.commands,
         timeoutSeconds: workOrder.verification.timeout_seconds,
+        signal: args.signal,
       });
       artifacts.verification = saveTextArtifact({
         services,
@@ -674,6 +694,9 @@ async function runImplementer(args: {
       finalReportUri: artifacts.finalReport?.uri,
     };
   } catch (error) {
+    if (isOperationAbortedError(error)) {
+      throw error;
+    }
     const reason: ImplementerFailureReason = "internal_error";
     finishRun({ services, context, agentId: agentProfile.agent_id, status: "failed", reason });
     return {
@@ -692,6 +715,7 @@ async function runReviewer(args: {
   workOrder: ParsedWorkOrderV1;
   agentProfile: ParsedAgentProfileV1;
   services: V1RunTaskServices;
+  signal?: AbortSignal;
   reviewContext?: {
     diffText: string;
     diffArtifactUri: string;
@@ -701,13 +725,13 @@ async function runReviewer(args: {
   };
 }): Promise<RunOutcome> {
   const { context, workOrder, agentProfile, services } = args;
+  throwIfAborted(args.signal);
   if (!args.reviewContext) {
     finishRun({ services, context, agentId: agentProfile.agent_id, status: "failed", reason: "internal_error" });
     return { kind: "reviewer_unusable", runId: context.runId, reason: "internal_error" };
   }
 
-  const applyDiff = services.applyDiffToWorkspace ?? defaultApplyDiffToWorkspace;
-  const applyResult = applyDiff({
+  const applyResult = services.sandboxProvider.applyDiff({
     workspacePath: context.worktree.workspacePath,
     diffText: args.reviewContext.diffText,
   });
@@ -815,8 +839,12 @@ async function runReviewer(args: {
         workspacePath: context.worktree.workspacePath,
         promptFile: brief.reviewerPromptPath,
         timeoutSeconds: agentProfile.limits?.timeout_seconds,
+        signal: args.signal,
       });
-    } catch {
+    } catch (error) {
+      if (isOperationAbortedError(error)) {
+        throw error;
+      }
       finishRun({ services, context, agentId: agentProfile.agent_id, status: "failed", reason: "spawn_failed" });
       return { kind: "reviewer_unusable", runId: context.runId, reason: "spawn_failed" };
     }
@@ -843,7 +871,7 @@ async function runReviewer(args: {
       summary: `${agentResult.stderrBytes} bytes`,
     });
 
-    const agentReason = agentFailureReason(agentResult);
+    const agentReason = agentFailureReason(agentProfile, agentResult);
     if (agentReason) {
       finishRun({ services, context, agentId: agentProfile.agent_id, status: "failed", reason: agentReason });
       return {
@@ -936,7 +964,10 @@ async function runReviewer(args: {
       return { kind: "reviewer_changes_requested", runId: context.runId, reviewVerdictUri: verdictArtifact.uri };
     }
     return { kind: "reviewer_rejected", runId: context.runId, reviewVerdictUri: verdictArtifact.uri };
-  } catch {
+  } catch (error) {
+    if (isOperationAbortedError(error)) {
+      throw error;
+    }
     finishRun({ services, context, agentId: agentProfile.agent_id, status: "failed", reason: "internal_error" });
     return { kind: "reviewer_unusable", runId: context.runId, reason: "internal_error" };
   }
@@ -951,6 +982,8 @@ export async function runTaskOnce(args: {
   db: Database;
   parentRunId?: string;
   handoffPacketUri?: string;
+  handoffPacket?: HandoffPacket;
+  signal?: AbortSignal;
   reviewContext?: {
     diffText: string;
     diffArtifactUri: string;
@@ -960,6 +993,7 @@ export async function runTaskOnce(args: {
   };
 }): Promise<RunOutcome> {
   void args.db;
+  throwIfAborted(args.signal);
 
   let context: RunContext;
   try {
@@ -990,20 +1024,33 @@ export async function runTaskOnce(args: {
     throw error;
   }
 
-  if (context.role === "implementer") {
-    return runImplementer({
+  try {
+    if (context.role === "implementer") {
+      return await runImplementer({
+        context,
+        workOrder: args.workOrder,
+        agentProfile: args.agentProfile,
+        services: args.services,
+        handoffPacket: args.handoffPacket,
+        signal: args.signal,
+      });
+    }
+
+    return await runReviewer({
       context,
       workOrder: args.workOrder,
       agentProfile: args.agentProfile,
       services: args.services,
+      signal: args.signal,
+      reviewContext: args.reviewContext,
     });
+  } catch (error) {
+    if (isOperationAbortedError(error) || args.signal?.aborted) {
+      cancelInterruptedRun({
+        services: args.services,
+        context,
+      });
+    }
+    throw error;
   }
-
-  return runReviewer({
-    context,
-    workOrder: args.workOrder,
-    agentProfile: args.agentProfile,
-    services: args.services,
-    reviewContext: args.reviewContext,
-  });
 }

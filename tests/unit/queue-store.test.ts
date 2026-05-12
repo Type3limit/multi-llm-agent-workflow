@@ -2,7 +2,7 @@ import SqliteDatabase from "better-sqlite3";
 import { migrate } from "../../src/storage/migrations.js";
 import { SqliteQueueStore } from "../../src/storage/queue-store.js";
 import type { Database } from "../../src/storage/database.js";
-import type { TaskQueueEntry } from "../../src/core/types.js";
+import type { ReviewContextRecord, TaskQueueEntry } from "../../src/core/types.js";
 
 function makeEntry(overrides: Partial<TaskQueueEntry> = {}): TaskQueueEntry {
   return {
@@ -159,6 +159,143 @@ describe("SqliteQueueStore", () => {
 
   it("get returns undefined for non-existent task", () => {
     expect(store.get("nonexistent")).toBeUndefined();
+  });
+
+  it("getWorkOrder parses persisted workorder_json", () => {
+    store.insert(makeEntry({ task_id: "T-workorder" }), JSON.stringify({
+      schema_version: "workflow/v1",
+      task_id: "T-workorder",
+      title: "Persisted WorkOrder",
+      type: "code_change",
+      goal: "Load this from SQLite.",
+      acceptance_criteria: ["loaded"],
+      repo: { path: "/tmp/repo" },
+      agent: {
+        required_capabilities: ["code_change"],
+        implementer_pool: ["agent-a"],
+      },
+      review: { enabled: false },
+    }));
+
+    const workOrder = store.getWorkOrder("T-workorder");
+
+    expect(workOrder?.task_id).toBe("T-workorder");
+    expect(workOrder?.project_id).toBe("default");
+    expect(workOrder?.agent.exclude_agent_ids).toEqual([]);
+  });
+
+  it("addWorkOrderExcludeAgentIds preserves unrelated JSON and only grows excludes", () => {
+    store.insert(makeEntry({ task_id: "T-grow" }), JSON.stringify({
+      schema_version: "workflow/v1",
+      task_id: "T-grow",
+      project_id: "project-a",
+      title: "Grow excludes",
+      type: "code_change",
+      goal: "Preserve every unrelated field.",
+      acceptance_criteria: ["fields remain"],
+      repo: { path: "/tmp/repo", base_ref: "main" },
+      custom_top_level: "keep-me",
+      agent: {
+        required_capabilities: ["code_change"],
+        implementer_pool: ["agent-a", "agent-b", "agent-c"],
+        reviewer_pool: ["reviewer-a"],
+        exclude_agent_ids: ["agent-a", "agent-b"],
+        custom_agent_field: "keep-agent-field",
+      },
+      review: { enabled: false, max_review_runs: 0 },
+      budget: {
+        max_wall_time_minutes: 12,
+        max_total_cost_units: 7,
+        max_runs: 3,
+      },
+    }));
+
+    const updated = store.addWorkOrderExcludeAgentIds("T-grow", [
+      "agent-b",
+      "agent-c",
+      "agent-a",
+    ]);
+
+    expect(updated.agent.exclude_agent_ids).toEqual(["agent-a", "agent-b", "agent-c"]);
+
+    const row = db
+      .prepare("select workorder_json from task_queue where task_id = ?")
+      .get("T-grow") as { workorder_json: string };
+    const raw = JSON.parse(row.workorder_json) as {
+      title: string;
+      goal: string;
+      custom_top_level: string;
+      agent: { exclude_agent_ids: string[]; custom_agent_field: string };
+      budget: { max_runs: number };
+    };
+
+    expect(raw.title).toBe("Grow excludes");
+    expect(raw.goal).toBe("Preserve every unrelated field.");
+    expect(raw.custom_top_level).toBe("keep-me");
+    expect(raw.agent.custom_agent_field).toBe("keep-agent-field");
+    expect(raw.agent.exclude_agent_ids).toEqual(["agent-a", "agent-b", "agent-c"]);
+    expect(raw.budget.max_runs).toBe(3);
+  });
+
+  it("setReviewContext + getReviewContext round-trips persisted reviewer inputs", () => {
+    store.insert(makeEntry({ task_id: "T-review" }), JSON.stringify({
+      schema_version: "workflow/v1",
+      task_id: "T-review",
+      title: "Review context",
+      type: "code_change",
+      goal: "Persist reviewer inputs.",
+      acceptance_criteria: ["context loads"],
+      repo: { path: "/tmp/repo" },
+      agent: {
+        required_capabilities: ["code_change"],
+        implementer_pool: ["agent-a"],
+        reviewer_pool: ["reviewer-a"],
+      },
+      review: { enabled: true },
+    }));
+
+    const context: ReviewContextRecord = {
+      implementer_run_id: "run-impl",
+      implementer_agent_id: "agent-a",
+      diff_artifact_uri: "artifact://T-review/run-impl/diff.patch",
+      final_report_uri: "artifact://T-review/run-impl/final_report.md",
+      verification_output_uri: "artifact://T-review/run-impl/verification.txt",
+    };
+    store.setReviewContext("T-review", context);
+
+    expect(store.getReviewContext("T-review")).toEqual(context);
+    const row = db
+      .prepare("select review_context_json from task_queue where task_id = ?")
+      .get("T-review") as { review_context_json: string };
+    expect(JSON.parse(row.review_context_json)).toEqual(context);
+  });
+
+  it("setReviewContext rejects malformed records", () => {
+    store.insert(makeEntry({ task_id: "T-bad-review" }), "{}");
+
+    expect(() =>
+      store.setReviewContext("T-bad-review", {
+        implementer_run_id: "",
+        implementer_agent_id: "agent-a",
+        diff_artifact_uri: "artifact://T-bad-review/run-impl/diff.patch",
+      }),
+    ).toThrow("implementer_run_id");
+  });
+
+  it("setHandoffPacketUri + getHandoffPacketUri round-trips pending handoff context", () => {
+    store.insert(makeEntry({ task_id: "T-handoff" }), "{}");
+
+    const uri = "artifact://T-handoff/run-impl/handoff_packet.json";
+    store.setHandoffPacketUri("T-handoff", uri);
+
+    expect(store.getHandoffPacketUri("T-handoff")).toBe(uri);
+    const row = db
+      .prepare("select handoff_packet_uri from task_queue where task_id = ?")
+      .get("T-handoff") as { handoff_packet_uri: string };
+    expect(row.handoff_packet_uri).toBe(uri);
+
+    store.setHandoffPacketUri("T-handoff", undefined);
+    expect(store.getHandoffPacketUri("T-handoff")).toBeUndefined();
   });
 
   it("release throws for non-existent task", () => {

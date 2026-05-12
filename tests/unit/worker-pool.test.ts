@@ -10,6 +10,12 @@ import type { TaskQueueEntry } from "../../src/core/types.js";
 import type { ParsedWorkOrderV1 } from "../../src/core/schemas-v1.js";
 import type { Worker, WorkerTaskHandler } from "../../src/queue/worker.js";
 import { DefaultWorkerPool, type WorkerServiceFactory } from "../../src/queue/worker-pool.js";
+import {
+  V1OrchestrationInterruptedError,
+  V1_SIGINT_GRACE_MS,
+  waitForV1PoolTerminalOrInterrupt,
+  type SigintSignalSource,
+} from "../../src/cli/run-command.js";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolvePromise: () => void = () => {};
@@ -52,6 +58,26 @@ class FakeQueue implements TaskQueue {
     return undefined;
   }
 
+  getWorkOrder(): ParsedWorkOrderV1 | undefined {
+    return undefined;
+  }
+
+  addWorkOrderExcludeAgentIds(): ParsedWorkOrderV1 {
+    throw new Error("not implemented");
+  }
+
+  setReviewContext(): void {}
+
+  getReviewContext(): undefined {
+    return undefined;
+  }
+
+  setHandoffPacketUri(): void {}
+
+  getHandoffPacketUri(): undefined {
+    return undefined;
+  }
+
   listTerminal(): TaskQueueEntry[] {
     return Array.from({ length: this.terminalCount }, (_, index) =>
       makeEntry(`T-${index}`, "accepted"),
@@ -86,6 +112,25 @@ class FakeWorker implements Worker {
 
   resolveStopped(): void {
     this.stopped.resolve();
+  }
+}
+
+class ManualSigintSignalSource implements SigintSignalSource {
+  private handler: (() => void) | undefined;
+
+  onSigint(handler: () => void): { dispose: () => void } {
+    this.handler = handler;
+    return {
+      dispose: () => {
+        if (this.handler === handler) {
+          this.handler = undefined;
+        }
+      },
+    };
+  }
+
+  trigger(): void {
+    this.handler?.();
   }
 }
 
@@ -269,6 +314,90 @@ describe("DefaultWorkerPool", () => {
     await pool.waitForAllTerminal();
 
     expect(sleepCalls).toBe(1);
+  });
+
+  it("SIGINT interruption stops workers with the v1 grace value and closes resources", async () => {
+    const signalSource = new ManualSigintSignalSource();
+    const workers: FakeWorker[] = [];
+    const closedWorkerIds: string[] = [];
+    const monitorQueue = new FakeQueue();
+
+    const pool = new DefaultWorkerPool({
+      factory: {
+        create: noopServices,
+        close: (workerId) => {
+          closedWorkerIds.push(workerId);
+        },
+      },
+      monitorQueue,
+      expectedTerminalCount: 1,
+      terminalPollMs: 10_000,
+      sleep: () => new Promise(() => {}),
+      createWorker: (args) => {
+        const worker = new FakeWorker(args.workerId);
+        workers.push(worker);
+        return worker;
+      },
+    });
+
+    pool.start(2);
+    const waitPromise = waitForV1PoolTerminalOrInterrupt({
+      pool,
+      signalSource,
+    });
+
+    signalSource.trigger();
+
+    await expect(waitPromise).rejects.toBeInstanceOf(V1OrchestrationInterruptedError);
+    expect(workers.map((worker) => worker.stopCalls)).toEqual([
+      [V1_SIGINT_GRACE_MS],
+      [V1_SIGINT_GRACE_MS],
+    ]);
+    expect(closedWorkerIds).toEqual(workers.map((worker) => worker.workerId));
+  });
+
+  it("SIGINT interruption cancels the terminal monitor waiter", async () => {
+    const signalSource = new ManualSigintSignalSource();
+    const workers: FakeWorker[] = [];
+    let listTerminalCalls = 0;
+    const monitorQueue = {
+      listTerminal: () => {
+        listTerminalCalls++;
+        return [];
+      },
+    };
+
+    const pool = new DefaultWorkerPool({
+      factory: { create: noopServices },
+      monitorQueue,
+      expectedTerminalCount: 1,
+      terminalPollMs: 1,
+      sleep: async () => {},
+      createWorker: (args) => {
+        const worker = new FakeWorker(args.workerId);
+        workers.push(worker);
+        return worker;
+      },
+    });
+
+    pool.start(1);
+    const waitPromise = waitForV1PoolTerminalOrInterrupt({
+      pool,
+      signalSource,
+      graceMs: 1,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(listTerminalCalls).toBeGreaterThan(0);
+
+    signalSource.trigger();
+
+    await expect(waitPromise).rejects.toBeInstanceOf(V1OrchestrationInterruptedError);
+    const callsAfterInterrupt = listTerminalCalls;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(listTerminalCalls).toBe(callsAfterInterrupt);
+    expect(workers.map((worker) => worker.stopCalls)).toEqual([[1]]);
   });
 });
 

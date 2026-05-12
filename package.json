@@ -2,7 +2,7 @@
   "name": "agentflow",
   "version": "0.1.0",
   "private": true,
-  "description": "Multi-LLM agent workflow orchestrator — v0 single-agent CLI",
+  "description": "Multi-LLM agent workflow orchestrator with v0 and v1 local CLI flows",
   "type": "module",
   "bin": {
     "agentflow": "./dist/cli/index.js"

@@ -26,16 +26,37 @@ Do not implement these in v1 (deferred to v2+):
 - Secret Leak Scanner.
 - Dashboard / HTTP API.
 - Long-running interactive sessions.
+- Session resume and model conversation restoration. The read-only `SessionSnapshot` aggregation seam is implemented in post-v1 v1.x Phase 2, and file-state-only fork-from-snapshot worktree reconstruction is implemented in v1.x Phase 3.
+- SessionStore or external KV memory.
+- Docker / micro-VM sandbox adapters. The `SandboxProvider` seam itself was a historical v1 non-goal and is implemented only in post-v1 v1.x Phase 1.
 - MCP / official_extension / managed_proxy modes.
 - Multi-WorkOrder DAG with dependency edges across tasks.
+- Planner / Coordinator agent that generates WorkOrders.
 - Multi-project sharding.
 - Distributed scheduler (multiple orchestrator processes).
 - Bidding mode (Agent self-reported cost estimates).
 - Replay / event sourcing reconstruction.
 - Automatic prompt rollback or capability downgrade detection.
-- User-initiated run cancellation.
+- User-initiated cancellation of a specific run or task beyond process SIGINT.
+  SIGINT graceful interruption is implemented for v1 run/batch.
 - Resource-aware scheduling (CPU/memory/disk fit).
 - Locality / privacy scoring.
+
+## Post-v1 Direction
+
+v1 is the local orchestration kernel. Keep the implementation focused on the v1 interfaces below; do not opportunistically add the four-layer architecture pieces while finishing this spec.
+
+The expected post-v1 order is:
+
+1. `SandboxProvider`: implemented in v1.x Phase 1 as a behavior-preserving seam around the current git worktree behavior. Add Docker / micro-VM adapters only when there is a real second implementation.
+2. `SessionSnapshot`: implemented in v1.x Phase 2 as a read-only aggregation over existing task_queue, agent_runs, artifacts, review context, and handoff URI state. It adds no table and does not fork or resume sessions.
+3. Fork-from-snapshot worktree reconstruction: implemented in v1.x Phase 3 as `SessionSnapshot` base evidence plus a selected persisted diff artifact -> fresh git worktree -> `SandboxProvider.applyDiff`. This reconstructs repository file state only.
+4. Planner / Coordinator agent: read a high-level goal and generate a flat fan-out list of independent v1 WorkOrders, then hand execution back to Scheduler + WorkerPool. It must not introduce DAG dependency edges without a later ADR.
+5. SessionStore: move snapshot/state storage behind SQLite or external KV only after the snapshot semantics are stable.
+
+Any agent implementing v1 should treat Planner / Coordinator, SessionStore, model conversation resume, Redis/KV or external memory, DAG dependency edges, HTTP/API behavior, second sandbox adapters, and any expansion beyond file-state-only fork-from-snapshot as future work unless a later prompt explicitly changes the scope.
+
+Post-v1 architecture work remains out of scope for the historical v1 spec unless a later prompt explicitly opens it. Use `v1-status.md` for the current implementation and coverage snapshot before starting any adapter work beyond the v1.x `SandboxProvider` seam.
 
 ## Recommended File Layout
 
@@ -57,6 +78,8 @@ See `v1-module-breakdown.md`. Module boundaries listed there are normative. File
 12. End-to-end integration tests with two fake agents (implementer + reviewer).
 
 Do not start with real Claude/Codex/Gemini Reviewer behavior. First prove the full path with two fake node executables: one writes a diff and exits 0, the other writes `review_verdict.json` and exits 0.
+
+Status note, 2026-05-12: the v1 run wiring, batch CLI, Worker outcome translation, and fake-agent CLI integration paths are implemented. This document remains the contract and review checklist; `v1-status.md` is the current status snapshot.
 
 ## Core Contracts
 
@@ -89,7 +112,7 @@ Rules:
 - Reject unsupported `schema_version` (only `workflow/v0` and `workflow/v1` are valid in v1).
 - Reject AgentProfile unless `outer_supervised: true` and `inner_tool_control: false`.
 - Reject WorkOrderV1 if `agent.required_capabilities` is empty.
-- Reject WorkOrderV1 if `agent.implementer_pool` is empty AND no agent in the registry exposes `roles: ["implementer"]` with matching capabilities. (Validated at AgentRegistry binding time, not parse time.)
+- Do not reject WorkOrderV1 solely because `agent.implementer_pool` is empty. Empty means any matching registry implementer may be scheduled; if no usable implementer exists, the Scheduler returns a refusal during worker handling. The narrow exception is the `agentflow run` `review.enabled=false` single-profile path, which validates its one AgentProfile before starting.
 - Reject AgentProfileV1 with `capabilities.kinds` empty or `capabilities.roles` empty.
 - Reject AgentProfileV1 with `cost_profile.estimated_cost_per_run_units < 0`.
 - Reject ReviewVerdict with `verdict` outside `{approved, changes_requested, rejected}`.
@@ -123,7 +146,7 @@ Reserved names listed in `v1-event-registry.md` must throw on append.
 
 Use SQLite through `better-sqlite3` (unchanged from v0).
 
-Required new tables (full DDL is in `v1-module-breakdown.md` §9). All tables include `project_id` for forward compatibility, even though v1 only uses `default`.
+Required new tables (full DDL is in `v1-module-breakdown.md` §9). `task_queue` includes `project_id` for forward compatibility, even though v1 only uses `default`; current `agent_metrics` and `task_budget` DDL do not include `project_id`.
 
 Required exported APIs (additions only):
 
@@ -134,6 +157,12 @@ export interface QueueStore {
   release(taskId: string, patch: Partial<TaskQueueEntry>): void;
   setStatus(taskId: string, status: TaskQueueEntry["status"]): void;
   get(taskId: string): TaskQueueEntry | undefined;
+  getWorkOrder(taskId: string): WorkOrderV1 | undefined;
+  addWorkOrderExcludeAgentIds(taskId: string, agentIds: string[]): WorkOrderV1;
+  setReviewContext(taskId: string, context: ReviewContextRecord): void;
+  getReviewContext(taskId: string): ReviewContextRecord | undefined;
+  setHandoffPacketUri(taskId: string, uri: string | undefined): void;
+  getHandoffPacketUri(taskId: string): string | undefined;
   listAll(): TaskQueueEntry[];
 }
 
@@ -180,6 +209,8 @@ export interface AgentRegistry {
     success: boolean;
     wallTimeMs: number;
     actualCostUnits?: number;
+    runId?: string;
+    failureReason?: RunFailedReason;
   }): void;
   refreshQuotaHealth(): void;
 }
@@ -187,7 +218,7 @@ export interface AgentRegistry {
 
 Acceptance requirements:
 
-- Loading a directory: read every `*.json` and `*.yaml`. Loading a file: parse one. Mixed lists allowed.
+- Loading a directory: read every `*.json`, `*.yaml`, and `*.yml`. Loading a file: parse one. Mixed lists allowed.
 - Duplicate `agent_id` -> throw with the offending paths in the error.
 - Invalid profile -> throw with the field path.
 - `candidatesFor` is deterministic: same inputs -> same ordering. Use stable sort by `agent_id` after filtering, then let Scheduler order by score.
@@ -206,6 +237,7 @@ export interface Scheduler {
     excludeAgentIds: string[];
     registry: AgentRegistry;
     budget: BudgetState;
+    mostRecentImplementerAgentId?: string;
   }): ScheduleDecision;
 }
 ```
@@ -255,7 +287,7 @@ Acceptance requirements:
   - First time any axis crosses 0.80 -> `quota.low` (scope=`task`).
   - First time any axis crosses 1.00 -> `quota.exhausted` (scope=`task`).
 - Defaults if WorkOrder omits caps: `max_runs=4`, `max_wall_time_minutes=30`, `max_total_cost_units=10`.
-- Cap values that conflict with `review.max_review_runs` (e.g. `max_runs < max_review_runs + 1`) are normalized at parse time, not at runtime: parser should reject the WorkOrder with a clear error.
+- Cap values that conflict with `review.max_review_runs` (e.g. `max_runs < max_review_runs + 1`) are rejected at parse time, not normalized at runtime.
 
 ## HandoffManager
 
@@ -264,6 +296,7 @@ Required exported API:
 ```ts
 export interface HandoffManager {
   build(args: {
+    taskId: string;
     fromRunId: string;
     fromAgentId: string;
     workOrderGoal: string;
@@ -271,10 +304,10 @@ export interface HandoffManager {
     diffArtifactUri?: string;
     verificationOutputUri?: string;
     reviewVerdictUri?: string;
-    priorExcludes: string[];
+    priorExcludes?: string[];
   }): HandoffPacket;
 
-  persist(packet: HandoffPacket, taskId: string): ArtifactRef;
+  persist(packet: HandoffPacket): ArtifactRef;
 
   attachToBrief(args: {
     workspacePath: string;
@@ -300,7 +333,7 @@ Acceptance requirements:
 - `claim()` is atomic via SQLite transaction; never returns the same task to two workers.
 - `claim()` does not return tasks in a terminal status.
 - `claim()` reclaims expired leases (i.e. a lease whose `lease_expires_at < now()`).
-- A reclaimed expired lease emits a single `run.failed` event (best-effort; payload `reason: "lease_expired"`) for the prior owner before re-dispatching.
+- v1 currently claims queue/store-level expired-lease reclamation only. Emitting a `run.failed` event with `reason: "lease_expired"` on reclaim is not currently implemented or claimed.
 
 ## Worker / WorkerPool
 
@@ -319,8 +352,8 @@ Acceptance requirements:
 - `start(N)` spawns N async loops sharing the orchestrator's database. Each Worker has a unique `workerId` (uuid).
 - Workers poll `claim()` with a 200 ms backoff when nothing is claimable.
 - A Worker that is shutting down does not call `claim()` again. In-flight runs finish or hit `graceMs`.
-- Each Worker uses its **own** SQLite connection (`Database` instance from `better-sqlite3`); connections must **never** be shared across workers. WAL mode must be enabled at migration time (`PRAGMA journal_mode = WAL;`) and `busy_timeout` set to at least 5000 ms per connection. A unit test pins this: a fixture starts 4 workers, asserts each holds a distinct `Database` reference, and asserts WAL mode is active.
-- A Worker that throws an uncaught exception logs the error, releases the lease (best-effort), and continues. The pool does not crash the whole process for one bad iteration.
+- Each Worker uses its **own** SQLite connection (`Database` instance from `better-sqlite3`); connections must **never** be shared across workers. `openDatabase()` enables WAL mode (`PRAGMA journal_mode = WAL;`) and sets `busy_timeout` to at least 5000 ms per connection before the worker runs migrations. A unit test pins this: a fixture starts 4 workers, asserts each holds a distinct `Database` reference, and asserts WAL mode is active.
+- A Worker that throws an uncaught exception releases the lease (best-effort) and continues. Structured logging for that path is not currently claimed.
 
 ## Orchestrator-v1 (per-attempt executor)
 
@@ -332,8 +365,19 @@ export async function runTaskOnce(args: {
   decision: ScheduleDecision;
   agentProfile: AgentProfileV1;
   workOrder: WorkOrderV1;
-  services: V1Services;
+  services: V1RunTaskServices;
   db: Database;
+  parentRunId?: string;
+  handoffPacketUri?: string;
+  handoffPacket?: HandoffPacket;
+  signal?: AbortSignal;
+  reviewContext?: {
+    diffText: string;
+    diffArtifactUri: string;
+    priorFinalReportText?: string;
+    implementerRunId?: string;
+    implementerAgentId?: string;
+  };
 }): Promise<RunOutcome>;
 ```
 
@@ -350,9 +394,9 @@ artifact.published       # stderr tail
 artifact.published       # diff
 artifact.published       # final report (if present)
 artifact.published       # task capsule
-verification.started
-verification.passed      # or verification.failed
-artifact.published       # verification output
+verification.started     # if verification commands are configured
+verification.passed      # or verification.failed, if commands are configured
+artifact.published       # verification output, if commands are configured
 run.completed            # OR run.failed
 task.edge_selected       # verifying -> reviewing  (review.enabled=true)
                          # OR verifying -> accepted (review.enabled=false)
@@ -400,7 +444,7 @@ task.edge_selected       # reviewing -> awaiting_human
 - `--agent` (singular) is accepted as an alias for `--agents` with one path.
 - Exit code 0 = task accepted, 1 = task failed, 2 = input invalid, 3 = task awaiting_human.
 
-`agentflow batch` (NEW):
+`agentflow batch` (implemented):
 
 - Accepts a directory of WorkOrders.
 - Loads AgentRegistry once.
@@ -412,7 +456,7 @@ task.edge_selected       # reviewing -> awaiting_human
 
 ## Testing Requirements
 
-Minimum tests before v1 can be considered complete:
+Current v1 coverage should stay traceable to code and tests. The lists below separate unit coverage from CLI integration coverage so unsupported behavior is not implied.
 
 ### Unit
 
@@ -424,27 +468,30 @@ Minimum tests before v1 can be considered complete:
 - Scheduler refusal precedence is pinned (one test per refusal_reason).
 - Scheduler enforces "reviewer != most recent implementer" even when caller forgets to pass the exclusion.
 - BudgetManager: `preLaunch` increments only `runs_used`; `postRun` updates wall time and cost; `quota.low` fires once at 0.80; `quota.exhausted` fires once at 1.00; double crossings do not re-emit.
-- HandoffManager: produces stable JSON for fixed inputs (golden file); always adds `fromAgentId` to `exclude_agent_ids`.
+- HandoffManager: produces stable JSON/summary text for fixed inputs; always adds `fromAgentId` to `exclude_agent_ids`.
 - ReviewVerdictParser: missing file, malformed JSON, invalid schema, valid verdict — all four cases.
-- TaskQueue: two concurrent `claim()` calls in a `Promise.all` only one returns the entry; the other returns `null`.
+- TaskQueue/QueueStore: after an entry is claimed, a second claim returns `null`, and a conditional update prevents modifying an already-claimed row.
 - TaskQueue: expired lease is reclaimable.
 - TaskQueue: terminal status entries are never returned by `claim()`.
-- MetricsStore rolling window correctness with 0, 1, 50, 60 entries.
+- MetricsStore rolling stats: zero records, one record, multiple-record success rate, truncation to the requested window size, null cost handling, agent isolation, and same-timestamp tie-breaking. Dedicated 50/60-entry boundary coverage is not currently claimed.
 - Event registry rejects every reserved name; accepts every v0 + v1 name.
 
-### Integration
+### CLI Integration
 
-- Two fake agents end-to-end (implementer always succeeds + reviewer always approves) -> task accepted.
-- Implementer succeeds + reviewer always `changes_requested` + only one implementer in pool -> after `max_review_runs` exceeded, task ends `awaiting_human` (or `failed` if budget hits first; pin one of the two with a fixture).
-- Implementer fails verification + fallback implementer succeeds + reviewer approves -> task accepted, `exclude_agent_ids` contains the failed agent.
-- Reviewer rejects -> task `awaiting_human`, no requeue happens.
-- `agentflow batch` with 4 WorkOrders, 2 workers: every task reaches a terminal status, no two workers ever own the same task simultaneously (asserted via event log).
-- Budget exhaustion mid-flight: a task with `max_runs=2` that needs 3 runs ends `failed`.
-- Lease expiration: a worker that is killed mid-run leaves the lease; a fresh `agentflow batch` invocation reclaims it (test by manually inserting an expired-lease row).
-- Reviewer worktree `git apply` failure -> reviewer run `failed` with `payload.reason: "diff_apply_failed"`; `git apply` stdout and stderr are persisted as artifacts under the reviewer `run_id`; the **implementer**'s `agent_id` is added to `exclude_agent_ids`; the **reviewer**'s `agent_id` is **not** added; `agent_metrics` does **not** record a row for the reviewer (it never executed); `task_budget.runs_used` is incremented.
-- Re-review on requeue: after a `changes_requested` outcome, the next implementer produces a new diff; the test asserts a fresh reviewer run is launched and a new `review.completed` event is emitted whose `run_id` is the new reviewer run, not a stale one. The orchestrator must not accept the task by reusing the prior verdict artifact.
-- Provider quota classification: a fake adapter that prints a known "rate limit exceeded" line on stderr and exits non-zero must produce `run.failed` with `payload.reason: "provider_rate_limited"`, and the next Scheduler call for that agent must score it `quota_health = 0.5` (or refuse it if it crosses the hard threshold). Same fixture for `provider_quota_exhausted` (Scheduler refuses) and `provider_auth_failed` (Scheduler refuses).
-- WorkerPool SQLite isolation: 4 workers in a single `agentflow batch` invocation each hold a distinct `Database` instance; `PRAGMA journal_mode` returns `wal` on every connection.
+`tests/integration/cli-run.test.ts` currently pins:
+
+- v1 review disabled: fake implementer reaches `accepted`.
+- v1 review enabled: fake implementer and reviewer approve through `agentflow run`.
+- Reviewer `rejected`: task moves to `awaiting_human` without requeueing.
+- Reviewer `changes_requested`: task requeues to a different implementer and a fresh reviewer.
+- Reviewer `diff_apply_failed`: reviewer run fails without launching the reviewer agent, git apply artifacts are persisted, the implementer is excluded, reviewer metrics are not recorded, and a later reviewer can approve a fresh diff.
+- v1 run SIGINT: exit 130, started run rows become `cancelled`, unfinished task remains non-terminal, and terminal task/cleanup events are not emitted.
+- v1 batch SIGINT: exit 130 with the same non-terminal task and cancelled-run guarantees for started batch work.
+- `agentflow batch`: multiple v1 WorkOrders from an agents directory reach `accepted` with two workers.
+- Scoped batch waiting: old terminal queue rows do not satisfy the wait for the current batch task ids.
+- Accepted terminal cleanup: `run.cleaned_up` is emitted and accepted task worktrees are removed.
+
+Provider classification, budget exhaustion, expired leases, failed-task cleanup candidate selection, and WorkerPool per-worker SQLite isolation are covered by unit tests. Killed-worker lease recovery as a fresh CLI invocation is not currently claimed as an end-to-end fixture.
 
 ## Review Checklist
 
@@ -455,15 +502,15 @@ Use this checklist when reviewing v1 implementation from another agent:
 - Every `agent_runs` row written by v1 has `role` and (where applicable) `parent_run_id` populated.
 - Every `task.dispatched` event has a `decision_id` that can be matched to either a picked run or a refusal.
 - `exclude_agent_ids` only grows for a given task; no code path shrinks it within a single task.
-- Reviewer worktree is always a fresh worktree built off `base_ref`, with the implementer's diff applied via `git apply --3way`. The reviewer never shares a worktree with the implementer.
-- Worktree cleanup happens at task terminal status, not per-run. A failed run's diff remains accessible to the next implementer.
+- Reviewer worktree is always a fresh worktree built off `base_ref`, with the implementer's diff applied via `git apply --3way --whitespace=nowarn -` through `SandboxProvider`. The reviewer never shares a worktree with the implementer.
+- Worktree cleanup happens after accepted/failed task status, not per-run. `awaiting_human` retains worktrees for manual inspection, and a failed run's diff remains accessible to the next implementer while the task can still requeue.
 - BudgetManager's `preLaunch` is called before `child_process.spawn`. No code path spawns an agent without a budget gate.
 - Scheduler refusal always emits `task.dispatched` with `picked_agent_id: null`; never silently aborts.
-- A single SQLite connection is **not** shared across worker threads; each Worker opens its own. WAL mode is enabled in migrations.
+- A single SQLite connection is **not** shared across worker threads; each Worker opens its own through `openDatabase()`, which enables WAL mode per connection.
 - All v0 events still fire correctly under v1; no v0 event has changed semantics except for `run.completed` which is now scoped to "process succeeded" only.
 - Reserved event names throw at the EventLog boundary.
 - Reviewer Agent's verdict file path is exactly `.agent-workflow/review_verdict.json`. Anything else is treated as missing.
-- `agentflow batch` exit codes match the CLI section; tests pin all four.
+- `agentflow batch` exit codes match the CLI section; keep tests aligned with any exit-code change.
 - The implementation does not add Context Broker, Acceptance Verifier, Anomaly Detector, Secret Scanner, or any other v2 component.
 - `git apply` stdout/stderr on `diff_apply_failed` are persisted as artifacts; the reviewer's `agent_id` is **not** added to `exclude_agent_ids` for that case; `agent_metrics` has no row for the never-executed reviewer.
 - A `changes_requested` outcome never lets the orchestrator accept the task on the strength of a prior `review_verdict` artifact; every acceptance is backed by a `review.completed` whose `run_id` is a reviewer run started **after** the accepted diff was produced.

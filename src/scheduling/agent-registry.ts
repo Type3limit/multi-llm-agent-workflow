@@ -5,6 +5,9 @@ import type { ParsedAgentProfileV1 } from "../core/schemas-v1.js";
 import { parseAgentProfileV1 } from "../core/schemas-v1.js";
 import { parseSimpleYaml } from "../cli/yaml-simple.js";
 import type { MetricsStore } from "../storage/metrics-store.js";
+import type { EventLog } from "../storage/event-log.js";
+import type { RunFailedReason } from "../core/events.js";
+import { generateEventId } from "../core/ids.js";
 
 export interface AgentRegistry {
   load(args: { sources: string[] }): void;
@@ -21,6 +24,7 @@ export interface AgentRegistry {
     wallTimeMs: number;
     actualCostUnits?: number;
     runId?: string;
+    failureReason?: RunFailedReason;
   }): void;
   refreshQuotaHealth(): void;
 }
@@ -34,11 +38,25 @@ interface InternalEntry {
 
 export class SqliteAgentRegistry implements AgentRegistry {
   private entries = new Map<string, InternalEntry>();
+  private readonly metricsStore: MetricsStore;
+  private readonly rollingWindowSize: number;
+  private readonly eventLog: EventLog | undefined;
+  private readonly projectId: string;
+  private readonly sharedQuotaHealth: Map<string, AgentRegistryEntry["quota_health"]>;
 
   constructor(
-    private metricsStore: MetricsStore,
-    private rollingWindowSize = 50,
-  ) {}
+    metricsStore: MetricsStore,
+    rollingWindowSize = 50,
+    eventLog?: EventLog,
+    projectId = "default",
+    sharedQuotaHealth?: Map<string, AgentRegistryEntry["quota_health"]>,
+  ) {
+    this.metricsStore = metricsStore;
+    this.rollingWindowSize = rollingWindowSize;
+    this.eventLog = eventLog;
+    this.projectId = projectId;
+    this.sharedQuotaHealth = sharedQuotaHealth ?? new Map();
+  }
 
   load(args: { sources: string[] }): void {
     for (const source of args.sources) {
@@ -143,7 +161,7 @@ export class SqliteAgentRegistry implements AgentRegistry {
       profile,
       loaded_from: filePath,
       rolling_metrics,
-      quota_health: "healthy",
+      quota_health: this.sharedQuotaHealth.get(profile.agent_id) ?? "healthy",
     });
   }
 
@@ -166,6 +184,8 @@ export class SqliteAgentRegistry implements AgentRegistry {
 
     const results: InternalEntry[] = [];
     for (const entry of this.entries.values()) {
+      this.syncQuotaHealth(entry);
+
       // Filter: quota_health exhausted
       if (entry.quota_health === "exhausted") continue;
 
@@ -201,6 +221,7 @@ export class SqliteAgentRegistry implements AgentRegistry {
     wallTimeMs: number;
     actualCostUnits?: number;
     runId?: string;
+    failureReason?: RunFailedReason;
   }): void {
     const entry = this.entries.get(args.agentId);
     if (!entry) {
@@ -218,15 +239,14 @@ export class SqliteAgentRegistry implements AgentRegistry {
 
     // Refresh rolling metrics for this agent
     this.refreshEntryMetrics(entry);
+    if (!args.success && args.failureReason) {
+      this.applyProviderFailure(entry, args.failureReason, runId);
+    }
   }
 
   refreshQuotaHealth(): void {
     for (const entry of this.entries.values()) {
-      // v1: no live quota probe; keep healthy unless we have explicit exhaustion data
-      // This will be enhanced when Scheduler/BudgetManager provide quota signals
-      if (entry.quota_health !== "exhausted") {
-        entry.quota_health = "healthy";
-      }
+      this.syncQuotaHealth(entry);
     }
   }
 
@@ -249,7 +269,72 @@ export class SqliteAgentRegistry implements AgentRegistry {
         };
   }
 
+  private applyProviderFailure(
+    entry: InternalEntry,
+    reason: RunFailedReason,
+    runId: string,
+  ): void {
+    switch (reason) {
+      case "provider_rate_limited": {
+        if (this.syncQuotaHealth(entry) !== "healthy") return;
+        this.setQuotaHealth(entry, "low");
+        this.emitAgentQuotaEvent("quota.low", entry.profile.agent_id, reason, runId);
+        return;
+      }
+      case "provider_quota_exhausted":
+      case "provider_auth_failed": {
+        if (this.syncQuotaHealth(entry) === "exhausted") return;
+        this.setQuotaHealth(entry, "exhausted");
+        this.emitAgentQuotaEvent("quota.exhausted", entry.profile.agent_id, reason, runId);
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  private syncQuotaHealth(entry: InternalEntry): AgentRegistryEntry["quota_health"] {
+    const shared = this.sharedQuotaHealth.get(entry.profile.agent_id);
+    if (shared) {
+      entry.quota_health = shared;
+    }
+    return entry.quota_health;
+  }
+
+  private setQuotaHealth(
+    entry: InternalEntry,
+    quotaHealth: AgentRegistryEntry["quota_health"],
+  ): void {
+    entry.quota_health = quotaHealth;
+    this.sharedQuotaHealth.set(entry.profile.agent_id, quotaHealth);
+  }
+
+  private emitAgentQuotaEvent(
+    eventType: "quota.low" | "quota.exhausted",
+    agentId: string,
+    reason: RunFailedReason,
+    runId: string,
+  ): void {
+    if (!this.eventLog) return;
+
+    this.eventLog.append({
+      event_id: generateEventId(),
+      event_type: eventType,
+      project_id: this.projectId,
+      run_id: runId,
+      agent_id: agentId,
+      skip_on_replay: true,
+      payload: {
+        scope: "agent",
+        agent_id: agentId,
+        reason,
+      },
+      created_at: new Date().toISOString(),
+    });
+  }
+
   private toExternal(entry: InternalEntry): AgentRegistryEntry {
+    this.syncQuotaHealth(entry);
     return {
       profile: structuredClone(entry.profile),
       loaded_from: entry.loaded_from,

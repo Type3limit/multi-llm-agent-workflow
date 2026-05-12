@@ -91,6 +91,42 @@ describe("LocalArtifactStore", () => {
     });
   });
 
+  describe("readText", () => {
+    it("reads text back from a LocalArtifactStore artifact URI", () => {
+      const ref = store.saveText({
+        projectId: "default",
+        taskId: "T-read",
+        runId: "R-read",
+        kind: "diff",
+        filename: "diff.patch",
+        content: "diff --git a/a b/a\n+change\n",
+      });
+
+      expect(store.readText(ref.uri)).toBe("diff --git a/a b/a\n+change\n");
+    });
+
+    it("rejects malformed artifact URIs", () => {
+      expect(() => store.readText("file:///tmp/diff.patch")).toThrow(
+        "Invalid artifact URI",
+      );
+      expect(() => store.readText("artifact://T/R")).toThrow(
+        "Invalid artifact URI",
+      );
+    });
+
+    it("rejects artifact URI path traversal and encoded segments", () => {
+      expect(() => store.readText("artifact://T/R/..")).toThrow(
+        "path traversal",
+      );
+      expect(() => store.readText("artifact://T/R/%2e%2e")).toThrow(
+        "encoded path segment",
+      );
+      expect(() => store.readText("artifact://T/R/sub/file.txt")).toThrow(
+        "Invalid artifact URI",
+      );
+    });
+  });
+
   describe("saveFile", () => {
     it("copies a file, computes checksum, and inserts row", () => {
       // Create a source file

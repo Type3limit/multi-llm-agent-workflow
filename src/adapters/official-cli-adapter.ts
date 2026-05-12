@@ -2,8 +2,16 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 import type { ParsedAgentProfile } from "../core/schemas.js";
 import type { ParsedAgentProfileV1 } from "../core/schemas-v1.js";
+import { OperationAbortedError, throwIfAborted } from "../core/abort-error.js";
 
 type RunnableAgentProfile = ParsedAgentProfile | ParsedAgentProfileV1;
+
+export type OfficialCliFailureReason =
+  | "agent_timed_out"
+  | "provider_rate_limited"
+  | "provider_quota_exhausted"
+  | "provider_auth_failed"
+  | "agent_nonzero_exit";
 
 export interface AgentProcessResult {
   exitCode: number | null;
@@ -22,6 +30,7 @@ export interface OfficialCliAdapter {
     workspacePath: string;
     promptFile: string;
     timeoutSeconds?: number;
+    signal?: AbortSignal;
   }): Promise<AgentProcessResult>;
 }
 
@@ -35,6 +44,41 @@ function renderArgs(args: string[], promptFile: string): string[] {
 
 function timeoutMs(seconds: number): number {
   return seconds * 1000;
+}
+
+function matchesAnyPattern(stderrTail: string, patterns: string[] | undefined): boolean {
+  if (!patterns?.length) return false;
+  return patterns.some((pattern) => new RegExp(pattern, "i").test(stderrTail));
+}
+
+export function classifyOfficialCliFailure(args: {
+  agentProfile: RunnableAgentProfile;
+  result: AgentProcessResult;
+}): OfficialCliFailureReason | undefined {
+  if (args.result.timedOut) {
+    return "agent_timed_out";
+  }
+
+  if (args.result.exitCode === 0) {
+    return undefined;
+  }
+
+  if (args.agentProfile.schema_version === "workflow/v1") {
+    const classification = args.agentProfile.failure_classification;
+    const stderrTail = args.result.stderrTail;
+
+    if (matchesAnyPattern(stderrTail, classification?.provider_rate_limited_stderr)) {
+      return "provider_rate_limited";
+    }
+    if (matchesAnyPattern(stderrTail, classification?.provider_quota_exhausted_stderr)) {
+      return "provider_quota_exhausted";
+    }
+    if (matchesAnyPattern(stderrTail, classification?.provider_auth_failed_stderr)) {
+      return "provider_auth_failed";
+    }
+  }
+
+  return "agent_nonzero_exit";
 }
 
 class OutputTailBuffer {
@@ -68,7 +112,10 @@ export class ChildProcessOfficialCliAdapter implements OfficialCliAdapter {
     workspacePath: string;
     promptFile: string;
     timeoutSeconds?: number;
+    signal?: AbortSignal;
   }): Promise<AgentProcessResult> {
+    throwIfAborted(args.signal);
+
     const profile = args.agentProfile;
     const promptFile = path.resolve(args.promptFile);
     const workspacePath = path.resolve(args.workspacePath);
@@ -111,6 +158,7 @@ export class ChildProcessOfficialCliAdapter implements OfficialCliAdapter {
     return new Promise((resolve, reject) => {
       let timedOut = false;
       let killed = false;
+      let aborting = false;
 
       const child = spawn(executable, renderedArgs, {
         cwd,
@@ -118,7 +166,20 @@ export class ChildProcessOfficialCliAdapter implements OfficialCliAdapter {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
+      const abortHandler = (): void => {
+        if (killed) return;
+        aborting = true;
+        killed = true;
+        child.kill();
+      };
+
       child.on("error", (err) => {
+        clearTimeout(timer);
+        args.signal?.removeEventListener("abort", abortHandler);
+        if (aborting) {
+          reject(new OperationAbortedError());
+          return;
+        }
         if (killed) return;
         reject(
           new Error(
@@ -133,6 +194,11 @@ export class ChildProcessOfficialCliAdapter implements OfficialCliAdapter {
         child.kill();
       }, timeoutMs(timeout));
 
+      args.signal?.addEventListener("abort", abortHandler, { once: true });
+      if (args.signal?.aborted) {
+        abortHandler();
+      }
+
       const stdoutBuf = new OutputTailBuffer(maxStdout);
       const stderrBuf = new OutputTailBuffer(maxStderr);
 
@@ -141,7 +207,13 @@ export class ChildProcessOfficialCliAdapter implements OfficialCliAdapter {
 
       child.on("close", (exitCode, signal) => {
         clearTimeout(timer);
+        args.signal?.removeEventListener("abort", abortHandler);
         killed = true;
+
+        if (aborting) {
+          reject(new OperationAbortedError());
+          return;
+        }
 
         const wallTimeMs = Date.now() - startTime;
 

@@ -86,8 +86,10 @@ interface CandidateAnalysis {
 function analyzeCandidates(
   registry: AgentRegistry,
   requiredCaps: Set<string>,
-  role: string,
+  role: "implementer" | "reviewer",
   excludeSet: Set<string>,
+  rolePoolSet: Set<string> | undefined,
+  rolePoolExcludedReason: string,
 ): CandidateAnalysis[] {
   const results: CandidateAnalysis[] = [];
 
@@ -97,6 +99,7 @@ function analyzeCandidates(
     const roleMatch = (entry.profile.capabilities.roles as readonly string[]).includes(role);
     const quotaExhausted = entry.quota_health === "exhausted";
     const isExcluded = excludeSet.has(entry.profile.agent_id);
+    const inRolePool = rolePoolSet === undefined || rolePoolSet.has(entry.profile.agent_id);
 
     let excluded = false;
     let excludedReason: string | undefined;
@@ -110,6 +113,9 @@ function analyzeCandidates(
     } else if (!roleMatch) {
       excluded = true;
       excludedReason = "role_mismatch";
+    } else if (!inRolePool) {
+      excluded = true;
+      excludedReason = rolePoolExcludedReason;
     } else if (quotaExhausted) {
       excluded = true;
       excludedReason = "quota_exhausted";
@@ -152,9 +158,23 @@ export class DefaultScheduler implements Scheduler {
     }
 
     const requiredCaps = new Set(workOrder.agent.required_capabilities);
+    const rolePool =
+      role === "implementer"
+        ? workOrder.agent.implementer_pool
+        : workOrder.agent.reviewer_pool;
+    const rolePoolSet = rolePool.length > 0 ? new Set(rolePool) : undefined;
+    const rolePoolExcludedReason =
+      role === "implementer" ? "not_in_implementer_pool" : "not_in_reviewer_pool";
 
     // Analyze all candidates
-    const analyses = analyzeCandidates(registry, requiredCaps, role, excludeSet);
+    const analyses = analyzeCandidates(
+      registry,
+      requiredCaps,
+      role,
+      excludeSet,
+      rolePoolSet,
+      rolePoolExcludedReason,
+    );
 
     // Eligible candidates: not excluded
     const eligible = analyses.filter((a) => !a.excluded);
@@ -181,16 +201,16 @@ export class DefaultScheduler implements Scheduler {
     }
 
     // 3. All capability+role matching candidates are excluded or exhausted
-    const capRoleNotExplicitlyExcluded = analyses.filter(
-      (a) => a.capabilityMatch && a.roleMatch && a.excludedReason !== "excluded_agent",
+    const capRoleNotExcludedBeforeQuota = analyses.filter(
+      (a) => a.capabilityMatch && a.roleMatch && (!a.excluded || a.excludedReason === "quota_exhausted"),
     );
-    if (capRoleNotExplicitlyExcluded.length === 0) {
-      // All matching candidates were explicitly excluded
+    if (capRoleNotExcludedBeforeQuota.length === 0) {
+      // All matching candidates were excluded before quota evaluation.
       return this.buildDecision(workOrder.task_id, role, null, "all_candidates_excluded", analyses, eligible);
     }
 
     // Check if all non-excluded cap+role matches are quota exhausted
-    const capRoleNonExhausted = capRoleNotExplicitlyExcluded.filter(
+    const capRoleNonExhausted = capRoleNotExcludedBeforeQuota.filter(
       (a) => !a.quotaExhausted,
     );
     if (capRoleNonExhausted.length === 0) {

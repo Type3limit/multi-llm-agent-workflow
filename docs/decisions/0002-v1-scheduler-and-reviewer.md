@@ -28,6 +28,20 @@ v1 introduces the smallest set of components that turn the system from "single s
 
 That is the entirety of v1's new control plane. The data plane gets three new SQLite tables (`task_queue`, `agent_metrics`, `task_budget`) and three new artifact kinds (`review_verdict`, `handoff_packet`, `schedule_decision`).
 
+## Relationship to Four-Layer Decoupling
+
+The four-layer direction (`Agent/Sandbox`, `Coordinator`, `Session`, `SessionStore`) is accepted as a useful post-v1 compass, but it does not expand v1.
+
+There is an explicit gate before any L1/L3/L2 work starts: the v1 Remaining list in `docs/implementation/v1-status.md` must be complete, and the fake-agent approve, changes_requested/requeue, and parallel batch e2e scenarios must pass. Until that gate is green, new abstraction work risks hiding unfinished v1 wiring bugs.
+
+Post-v1 order:
+
+1. **SandboxProvider seam**: implemented in v1.x Phase 1 by wrapping current git worktree behavior first. Docker / micro-VM adapters are later adapters, not part of this ADR.
+2. **SessionSnapshot**: implemented in v1.x Phase 2 as a read-only aggregation contract over existing task_queue, agent_runs, artifacts, review-context, and handoff rows. It introduces no table and does not resume model conversation state.
+3. **Fork from snapshot**: implemented in v1.x Phase 3 for repository file state only. It prefers reconstruction over retaining old worktrees forever: selected run base commit or snapshot base ref + selected persisted diff artifact -> fresh git worktree -> `SandboxProvider.applyDiff`. This reuses the reviewer flow's patch application semantics and keeps disk use bounded. It requires diff artifacts to remain durable and base commits not to be garbage-collected before snapshot expiry.
+4. **Coordinator agent**: first version generates flat fan-out WorkOrders that can be submitted to `agentflow batch`. It must not introduce dependency edges, conditional graph execution, or a general DAG without a new ADR.
+5. **SessionStore**: only after the SQLite-backed snapshot contract has proven useful should storage move behind Redis/KV or another external runtime store.
+
 ## Consequences (positive)
 
 - Multi-LLM behaviour becomes real: Implementer and Reviewer can be different vendors, different models, different cost profiles.
@@ -89,6 +103,8 @@ Bidding is a good v2/v3 addition once `agent_metrics` has accumulated real estim
 
 Rejected because no real workflow yet exists with proven multi-WorkOrder dependencies. v1 keeps each WorkOrder independent. `agentflow batch` runs them in parallel, but does not honor cross-WorkOrder dependencies. v2's Planner introduces the DAG, driven by a real user-facing goal that needs it.
 
+Clarification after the four-layer review: a future Coordinator agent may still emit a **flat fan-out** list of independent WorkOrders without reopening this decision. That uses the existing `agentflow batch` semantics. A true DAG means dependency edges, readiness checks, aggregate node semantics, or conditional branches; that requires a new ADR.
+
 ## Why This Is the Right Slice
 
 A vertical slice should answer one question that cannot be answered without building it. v1 answers:
@@ -127,10 +143,13 @@ v1's contracts are designed to compose with v2 components without rewrite:
 
 When v1 is in steady use, v2 should pick the next-most-pressured block. Likely candidates, in rough order of expected pressure:
 
-1. **Context Broker** if `budget.max_total_cost_units` is consistently exceeded by overlong briefs.
-2. **Acceptance Verifier** if reviewer verdicts are frequently overturned by humans (i.e. reviewers approve things humans reject).
-3. **Anomaly Detector + Secret Scanner** when v1 is deployed to a real codebase with secrets and CI hooks.
-4. **HTTP API + multi-process workers** when local-CLI parallelism is not enough.
-5. **Planner + DAG** when users start submitting tasks that obviously decompose.
+1. **SandboxProvider seam** immediately after the v1 gate is green. This is implemented in v1.x Phase 1 with the behavior-preserving git worktree adapter.
+2. **Expand beyond file-state-only snapshot reconstruction** only if repeated related runs need model conversation resume or richer session semantics. v1.x Phase 3 already reconstructs repository file state in a fresh worktree from snapshot base evidence plus a selected diff artifact.
+3. **Flat fan-out Coordinator agent** when users keep manually writing several independent WorkOrders from one high-level goal.
+4. **Context Broker** if `budget.max_total_cost_units` is consistently exceeded by overlong briefs.
+5. **Acceptance Verifier** if reviewer verdicts are frequently overturned by humans (i.e. reviewers approve things humans reject).
+6. **Anomaly Detector + Secret Scanner** when v1 is deployed to a real codebase with secrets and CI hooks.
+7. **HTTP API + multi-process workers** when local-CLI parallelism is not enough.
+8. **DAG Planner** only after flat fan-out has proven insufficient and a new ADR defines dependency semantics.
 
 The decision of which to do first should be made when v1 has run on real workloads for at least a few weeks; not now.

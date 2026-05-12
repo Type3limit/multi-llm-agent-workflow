@@ -1,5 +1,5 @@
 import type { QueueStore } from "../storage/queue-store.js";
-import type { TaskQueueEntry } from "../core/types.js";
+import type { ReviewContextRecord, TaskQueueEntry } from "../core/types.js";
 import type { ParsedWorkOrderV1 } from "../core/schemas-v1.js";
 
 // ─── TaskQueue interface ─────────────────────────────────────────────────────
@@ -17,6 +17,18 @@ export interface TaskQueue {
   setStatus(taskId: string, status: TaskQueueEntry["status"]): void;
 
   get(taskId: string): TaskQueueEntry | undefined;
+
+  getWorkOrder(taskId: string): ParsedWorkOrderV1 | undefined;
+
+  addWorkOrderExcludeAgentIds(taskId: string, agentIds: string[]): ParsedWorkOrderV1;
+
+  setReviewContext(taskId: string, context: ReviewContextRecord): void;
+
+  getReviewContext(taskId: string): ReviewContextRecord | undefined;
+
+  setHandoffPacketUri(taskId: string, uri: string | undefined): void;
+
+  getHandoffPacketUri(taskId: string): string | undefined;
 
   listTerminal(): TaskQueueEntry[];
 }
@@ -107,7 +119,9 @@ export class DefaultTaskQueue implements TaskQueue {
    *     AND strictly earlier than this.now() (NULL < @now is not true in SQLite).
    *
    * - If that row has a cached WorkOrder, use defaultLeaseDurationSeconds(wo).
-   * - If that row has no cached WorkOrder, use the 3600s fallback.
+   * - If that row has no cached WorkOrder, load it from persisted storage,
+   *   cache it, and use defaultLeaseDurationSeconds(wo).
+   * - If that row has no parseable persisted WorkOrder, use the 3600s fallback.
    * - If no row is claimable, returns 3600s (the value is not behaviorally
    *   important since store.claim() will return null anyway).
    */
@@ -132,6 +146,16 @@ export class DefaultTaskQueue implements TaskQueue {
       if (wo) {
         return defaultLeaseDurationSeconds(wo);
       }
+
+      try {
+        const persisted = this.store.getWorkOrder(entry.task_id);
+        if (persisted) {
+          this.workOrders.set(entry.task_id, persisted);
+          return defaultLeaseDurationSeconds(persisted);
+        }
+      } catch {
+        // Unknown or unparseable persisted WorkOrders retain the conservative fallback.
+      }
       return 3600; // unknown WorkOrder → 3600s fallback
     }
 
@@ -149,6 +173,43 @@ export class DefaultTaskQueue implements TaskQueue {
 
   get(taskId: string): TaskQueueEntry | undefined {
     return this.store.get(taskId);
+  }
+
+  getWorkOrder(taskId: string): ParsedWorkOrderV1 | undefined {
+    const cached = this.workOrders.get(taskId);
+    if (cached) {
+      return structuredClone(cached);
+    }
+
+    const workOrder = this.store.getWorkOrder(taskId);
+    if (workOrder) {
+      this.workOrders.set(taskId, workOrder);
+      return structuredClone(workOrder);
+    }
+    return workOrder;
+  }
+
+  addWorkOrderExcludeAgentIds(taskId: string, agentIds: string[]): ParsedWorkOrderV1 {
+    const workOrder = this.store.addWorkOrderExcludeAgentIds(taskId, agentIds);
+    this.workOrders.set(taskId, workOrder);
+    return structuredClone(workOrder);
+  }
+
+  setReviewContext(taskId: string, context: ReviewContextRecord): void {
+    this.store.setReviewContext(taskId, context);
+  }
+
+  getReviewContext(taskId: string): ReviewContextRecord | undefined {
+    const context = this.store.getReviewContext(taskId);
+    return context ? structuredClone(context) : undefined;
+  }
+
+  setHandoffPacketUri(taskId: string, uri: string | undefined): void {
+    this.store.setHandoffPacketUri(taskId, uri);
+  }
+
+  getHandoffPacketUri(taskId: string): string | undefined {
+    return this.store.getHandoffPacketUri(taskId);
   }
 
   listTerminal(): TaskQueueEntry[] {

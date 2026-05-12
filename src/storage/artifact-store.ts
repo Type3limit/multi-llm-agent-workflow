@@ -28,6 +28,8 @@ export interface ArtifactStore {
     filename: string;
     summary?: string;
   }): ArtifactRef;
+
+  readText(uri: string): string;
 }
 
 function validatePathSegment(name: string, value: string): void {
@@ -40,12 +42,41 @@ function validatePathSegment(name: string, value: string): void {
   if (value.includes("..")) {
     throw new Error(`Invalid ${name} (path traversal): "${value}"`);
   }
+  if (value.includes("%")) {
+    throw new Error(`Invalid ${name} (encoded path segment): "${value}"`);
+  }
   if (path.isAbsolute(value)) {
     throw new Error(`Invalid ${name} (absolute path): "${value}"`);
   }
   if (value !== path.basename(value)) {
     throw new Error(`Invalid ${name} (contains path separator): "${value}"`);
   }
+}
+
+export function parseArtifactUri(uri: string): {
+  taskId: string;
+  runId: string;
+  filename: string;
+} {
+  const prefix = "artifact://";
+  if (!uri.startsWith(prefix)) {
+    throw new Error(`Invalid artifact URI: ${uri}`);
+  }
+  const rest = uri.slice(prefix.length);
+  if (rest.includes("?") || rest.includes("#") || rest.includes("\\")) {
+    throw new Error(`Invalid artifact URI: ${uri}`);
+  }
+
+  const parts = rest.split("/");
+  if (parts.length !== 3) {
+    throw new Error(`Invalid artifact URI: ${uri}`);
+  }
+
+  const [taskId, runId, filename] = parts;
+  validatePathSegment("taskId", taskId);
+  validatePathSegment("runId", runId);
+  validatePathSegment("filename", filename);
+  return { taskId, runId, filename };
 }
 
 export class LocalArtifactStore implements ArtifactStore {
@@ -70,6 +101,16 @@ export class LocalArtifactStore implements ArtifactStore {
 
   private artifactUri(taskId: string, runId: string, filename: string): string {
     return `artifact://${taskId}/${runId}/${filename}`;
+  }
+
+  private artifactPath(taskId: string, runId: string, filename: string): string {
+    const baseDir = this.artifactDir(taskId, runId);
+    const filePath = path.resolve(baseDir, filename);
+    const relative = path.relative(baseDir, filePath);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`Invalid artifact URI path traversal: ${filename}`);
+    }
+    return filePath;
   }
 
   private insertArtifact(params: {
@@ -172,5 +213,11 @@ export class LocalArtifactStore implements ArtifactStore {
       summary: args.summary,
       filename: args.filename,
     });
+  }
+
+  readText(uri: string): string {
+    const parsed = parseArtifactUri(uri);
+    const filePath = this.artifactPath(parsed.taskId, parsed.runId, parsed.filename);
+    return fs.readFileSync(filePath, "utf-8");
   }
 }

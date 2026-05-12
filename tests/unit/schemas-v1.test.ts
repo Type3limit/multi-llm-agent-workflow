@@ -194,6 +194,43 @@ describe("AgentProfileV1Schema", () => {
     expect(result.reliability.initial_avg_latency_ms).toBe(60000);
   });
 
+  it("parses valid provider failure classifier patterns", () => {
+    const result = AgentProfileV1Schema.parse({
+      ...validImplementerProfileV1,
+      failure_classification: {
+        provider_rate_limited_stderr: ["rate limit(?:ed)?"],
+        provider_quota_exhausted_stderr: ["quota.*exhausted"],
+        provider_auth_failed_stderr: ["invalid api key"],
+      },
+    });
+
+    expect(result.failure_classification?.provider_rate_limited_stderr).toEqual([
+      "rate limit(?:ed)?",
+    ]);
+  });
+
+  it("rejects empty provider failure classifier patterns", () => {
+    expect(() =>
+      AgentProfileV1Schema.parse({
+        ...validImplementerProfileV1,
+        failure_classification: {
+          provider_rate_limited_stderr: [""],
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects invalid provider failure classifier regex patterns", () => {
+    expect(() =>
+      AgentProfileV1Schema.parse({
+        ...validImplementerProfileV1,
+        failure_classification: {
+          provider_quota_exhausted_stderr: ["["],
+        },
+      }),
+    ).toThrow("Invalid JavaScript RegExp pattern");
+  });
+
   it("rejects unsupported schema_version", () => {
     expect(() =>
       AgentProfileV1Schema.parse({ ...validImplementerProfileV1, schema_version: "v2" }),
@@ -544,6 +581,22 @@ describe("HandoffPacketSchema", () => {
     });
     expect(result.reason).toBe("verification_failed");
     expect(result.exclude_agent_ids).toEqual(["agent-a"]);
+  });
+
+  it("parses diff_apply_failed handoff packets", () => {
+    const result = HandoffPacketSchema.parse({
+      schema_version: "agent-workflow/1",
+      task_id: "T-1",
+      from_run_id: "R-1",
+      from_agent_id: "agent-a",
+      reason: "diff_apply_failed",
+      summary: "Reviewer could not apply the diff.",
+      remaining_work: "Regenerate a clean patch.",
+      exclude_agent_ids: ["agent-a"],
+      created_at: "2026-05-06T10:00:00Z",
+    });
+
+    expect(result.reason).toBe("diff_apply_failed");
   });
 
   it("rejects invalid reason", () => {

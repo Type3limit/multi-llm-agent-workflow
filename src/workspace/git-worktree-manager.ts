@@ -58,6 +58,24 @@ function git(args: string[], cwd?: string): string {
   }
 }
 
+function gitRaw(args: string[], cwd?: string): string {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30_000,
+    });
+  } catch (err: unknown) {
+    const stderr = (err as { stderr?: string }).stderr ?? "";
+    const stdout = (err as { stdout?: string }).stdout ?? "";
+    const message = (err as { message?: string }).message ?? String(err);
+    throw new Error(
+      `git ${args.join(" ")} failed: ${message}\nstdout: ${stdout}\nstderr: ${stderr}`,
+    );
+  }
+}
+
 function isGitRepo(repoPath: string): boolean {
   try {
     git(["rev-parse", "--git-dir"], repoPath);
@@ -82,7 +100,7 @@ export class CliGitWorktreeManager implements GitWorktreeManager {
   }
 
   diff(workspacePath: string): string {
-    return git(["diff"], workspacePath);
+    return gitRaw(["diff"], workspacePath);
   }
 
   cleanup(workspacePath: string): void {

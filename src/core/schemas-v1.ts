@@ -80,6 +80,17 @@ export function parseWorkOrderV1(input: unknown): ParsedWorkOrderV1 {
 
 // ─── AgentProfileV1 ──────────────────────────────────────────────────────────
 
+const ProviderFailurePatternSchema = z.string().min(1).superRefine((pattern, ctx) => {
+  try {
+    new RegExp(pattern);
+  } catch (err) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Invalid JavaScript RegExp pattern "${pattern}": ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+});
+
 export const AgentProfileV1Schema = z.object({
   schema_version: z.literal("workflow/v1"),
   agent_id: z.string().min(1),
@@ -114,6 +125,13 @@ export const AgentProfileV1Schema = z.object({
         "unknown",
       ]),
       estimated_cost_per_run_units: z.number().min(0),
+    })
+    .optional(),
+  failure_classification: z
+    .object({
+      provider_rate_limited_stderr: z.array(ProviderFailurePatternSchema).optional(),
+      provider_quota_exhausted_stderr: z.array(ProviderFailurePatternSchema).optional(),
+      provider_auth_failed_stderr: z.array(ProviderFailurePatternSchema).optional(),
     })
     .optional(),
   quota: z
@@ -253,6 +271,7 @@ export const HandoffPacketSchema = z.object({
   reason: z.enum([
     "verification_failed",
     "review_changes_requested",
+    "diff_apply_failed",
     "review_rejected",
     "agent_timed_out",
     "agent_nonzero_exit",

@@ -7,6 +7,7 @@ import {
   CliGitWorktreeManager,
   type PreparedWorktree,
 } from "../../src/workspace/git-worktree-manager.js";
+import { GitWorktreeSandboxProvider } from "../../src/workspace/sandbox-provider.js";
 
 function git(args: string[], cwd: string): string {
   return execFileSync("git", args, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -221,6 +222,44 @@ describe("CliGitWorktreeManager", () => {
       expect(() =>
         manager.cleanup(path.join(os.tmpdir(), "nonexistent-worktree")),
       ).toThrow();
+    });
+  });
+
+  describe("GitWorktreeSandboxProvider", () => {
+    it("applies a clean diff into a prepared worktree", () => {
+      const provider = new GitWorktreeSandboxProvider(manager);
+      const source = provider.prepareWorkspace({
+        repoPath: repoDir,
+        taskId: "T-provider-src",
+        runId: "R-provider-src",
+      });
+      const target = provider.prepareWorkspace({
+        repoPath: repoDir,
+        taskId: "T-provider-dst",
+        runId: "R-provider-dst",
+      });
+
+      try {
+        fs.writeFileSync(
+          path.join(source.workspacePath, "README.md"),
+          "# Provider Applied\n",
+          "utf-8",
+        );
+        const diff = provider.diff({ workspacePath: source.workspacePath });
+        const result = provider.applyDiff({
+          workspacePath: target.workspacePath,
+          diffText: diff,
+        });
+
+        expect(result.ok).toBe(true);
+        const targetReadme = fs
+          .readFileSync(path.join(target.workspacePath, "README.md"), "utf-8")
+          .replace(/\r\n/g, "\n");
+        expect(targetReadme).toBe("# Provider Applied\n");
+      } finally {
+        provider.cleanup({ workspacePath: source.workspacePath });
+        provider.cleanup({ workspacePath: target.workspacePath });
+      }
     });
   });
 });

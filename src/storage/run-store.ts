@@ -5,6 +5,7 @@ import { nullableString } from "./helpers.js";
 interface Stmt {
   run(params: Record<string, unknown>): void;
   get(...params: unknown[]): unknown | undefined;
+  all(...params: unknown[]): unknown[];
 }
 
 export interface RunRecord {
@@ -24,10 +25,21 @@ export interface RunRecord {
   handoff_packet_uri?: string;
 }
 
+export interface RunCleanupRecord {
+  run_id: string;
+  task_id: string;
+  project_id: string;
+  agent_id: string;
+  status: RunStatus;
+  role?: "implementer" | "reviewer";
+  workspace_path?: string;
+}
+
 export interface RunStore {
   create(record: RunRecord): void;
   updateStatus(runId: string, status: RunStatus, patch?: Partial<RunRecord>): void;
   get(runId: string): RunRecord | undefined;
+  listCleanupCandidates(taskIds: readonly string[]): RunCleanupRecord[];
 }
 
 const IMMUTABLE_FIELDS = new Set(["id", "project_id", "task_id", "agent_id"]);
@@ -135,5 +147,43 @@ export class SqliteRunStore implements RunStore {
       parent_run_id: nullableString(row.parent_run_id),
       handoff_packet_uri: nullableString(row.handoff_packet_uri),
     };
+  }
+
+  listCleanupCandidates(taskIds: readonly string[]): RunCleanupRecord[] {
+    if (taskIds.length === 0) {
+      return [];
+    }
+
+    const uniqueTaskIds = [...new Set(taskIds)];
+    const placeholders = uniqueTaskIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(`
+        select
+          r.id as run_id,
+          r.task_id as task_id,
+          r.project_id as project_id,
+          r.agent_id as agent_id,
+          r.status as status,
+          r.role as role,
+          r.workspace_path as workspace_path
+        from agent_runs r
+        inner join task_queue q
+          on q.task_id = r.task_id
+         and q.project_id = r.project_id
+        where q.status in ('accepted', 'failed')
+          and q.task_id in (${placeholders})
+        order by q.task_id asc, r.rowid asc
+      `)
+      .all(...uniqueTaskIds) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      run_id: row.run_id as string,
+      task_id: row.task_id as string,
+      project_id: row.project_id as string,
+      agent_id: row.agent_id as string,
+      status: row.status as RunStatus,
+      role: nullableString(row.role) as RunCleanupRecord["role"],
+      workspace_path: nullableString(row.workspace_path),
+    }));
   }
 }

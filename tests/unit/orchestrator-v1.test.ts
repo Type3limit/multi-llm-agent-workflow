@@ -7,6 +7,7 @@ import type {
   ArtifactKindV1,
   ArtifactRef,
   EventEnvelope,
+  HandoffPacket,
   ReviewVerdict,
   ScheduleDecision,
   TaskQueueEntry,
@@ -27,15 +28,18 @@ import type { EventLog } from "../../src/storage/event-log.js";
 import type { RunRecord, RunStore } from "../../src/storage/run-store.js";
 import type { ArtifactStore } from "../../src/storage/artifact-store.js";
 import type {
-  GitWorktreeManager,
-  PreparedWorktree,
-} from "../../src/workspace/git-worktree-manager.js";
+  PreparedSandboxWorkspace,
+  SandboxDiffApplyResult,
+  SandboxProvider,
+} from "../../src/workspace/sandbox-provider.js";
 import { FileTaskCapsuleWriter } from "../../src/workspace/task-capsule-writer.js";
 import { FileReviewBriefWriter } from "../../src/workspace/review-brief-writer.js";
+import { DefaultHandoffManager } from "../../src/scheduling/handoff-manager.js";
 import type {
   AgentProcessResult,
   OfficialCliAdapter,
 } from "../../src/adapters/official-cli-adapter.js";
+import { classifyOfficialCliFailure } from "../../src/adapters/official-cli-adapter.js";
 import type {
   VerificationResult,
   VerificationRunner,
@@ -82,6 +86,10 @@ class FakeRunStore implements RunStore {
   get(runId: string): RunRecord | undefined {
     const record = this.records.get(runId);
     return record ? { ...record } : undefined;
+  }
+
+  listCleanupCandidates(): [] {
+    return [];
   }
 }
 
@@ -156,17 +164,25 @@ class FakeArtifactStore implements ArtifactStore {
   }
 }
 
-class FakeGitWorktreeManager implements GitWorktreeManager {
-  readonly prepared: PreparedWorktree[] = [];
+class FakeSandboxProvider implements SandboxProvider {
+  readonly prepared: PreparedSandboxWorkspace[] = [];
+  readonly applyCalls: Array<{ workspacePath: string; diffText: string }> = [];
   diffText = "diff --git a/file.txt b/file.txt\n+changed\n";
 
-  constructor(private readonly root: string) {}
+  constructor(
+    private readonly root: string,
+    private readonly applyResult: SandboxDiffApplyResult = {
+      ok: true,
+      stdout: "",
+      stderr: "",
+    },
+  ) {}
 
-  prepare(args: {
+  prepareWorkspace(args: {
     repoPath: string;
     taskId: string;
     runId: string;
-  }): PreparedWorktree {
+  }): PreparedSandboxWorkspace {
     const workspacePath = path.join(this.root, "worktrees", args.runId);
     fs.mkdirSync(workspacePath, { recursive: true });
     const prepared = {
@@ -183,8 +199,17 @@ class FakeGitWorktreeManager implements GitWorktreeManager {
     return "";
   }
 
+  status(): string {
+    return "";
+  }
+
   diff(): string {
     return this.diffText;
+  }
+
+  applyDiff(args: { workspacePath: string; diffText: string }): SandboxDiffApplyResult {
+    this.applyCalls.push(args);
+    return this.applyResult;
   }
 
   cleanup(): void {}
@@ -281,10 +306,9 @@ interface Harness {
   eventLog: FakeEventLog;
   runStore: FakeRunStore;
   artifactStore: FakeArtifactStore;
-  gitManager: FakeGitWorktreeManager;
+  sandboxProvider: FakeSandboxProvider;
   adapter: FakeAdapter;
   verifier: FakeVerificationRunner;
-  applyCalls: Array<{ workspacePath: string; diffText: string }>;
   services: Parameters<typeof runTaskOnce>[0]["services"];
 }
 
@@ -306,35 +330,33 @@ function makeHarness(args: {
   const eventLog = new FakeEventLog();
   const runStore = new FakeRunStore();
   const artifactStore = new FakeArtifactStore();
-  const gitManager = new FakeGitWorktreeManager(root);
   const adapter = new FakeAdapter(args.adapterMode);
   const verifier = new FakeVerificationRunner(args.verification);
-  const applyCalls: Array<{ workspacePath: string; diffText: string }> = [];
   const applyResult = args.applyResult ?? { ok: true as const, stdout: "", stderr: "" };
+  const sandboxProvider = new FakeSandboxProvider(root, applyResult);
 
   return {
     root,
     eventLog,
     runStore,
     artifactStore,
-    gitManager,
+    sandboxProvider,
     adapter,
     verifier,
-    applyCalls,
     services: {
       eventLog,
       runStore,
       artifactStore,
-      gitManager,
+      sandboxProvider,
       taskCapsuleWriter: new FileTaskCapsuleWriter(),
       reviewBriefWriter: new FileReviewBriefWriter(),
       adapter,
       verifier,
+      handoffManager: new DefaultHandoffManager({
+        artifactStore,
+        now: () => new Date("2026-01-01T00:00:00.000Z"),
+      }),
       now: () => new Date("2026-01-01T00:00:00.000Z"),
-      applyDiffToWorkspace: (applyArgs) => {
-        applyCalls.push(applyArgs);
-        return applyResult;
-      },
     },
   };
 }
@@ -441,6 +463,37 @@ function makeVerdict(verdict: ReviewVerdict["verdict"]): ReviewVerdict {
   };
 }
 
+function processResult(overrides: Partial<AgentProcessResult> = {}): AgentProcessResult {
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    stdoutTail: "",
+    stderrTail: "",
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    wallTimeMs: 10,
+    ...overrides,
+  };
+}
+
+function makeHandoffPacket(overrides: Partial<HandoffPacket> = {}): HandoffPacket {
+  return {
+    schema_version: "agent-workflow/1",
+    task_id: "T-v1",
+    from_run_id: "run-previous",
+    from_agent_id: "agent-previous",
+    reason: "review_changes_requested",
+    summary: "Previous review requested changes.",
+    diff_artifact_uri: "artifact://T-v1/run-previous/diff.patch",
+    review_verdict_uri: "artifact://T-v1/run-review/review_verdict.json",
+    remaining_work: "Change the code.",
+    exclude_agent_ids: ["agent-previous"],
+    created_at: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
 function eventTypes(harness: Harness, runId: string): string[] {
   return harness.eventLog
     .listByRun("P-v1", runId)
@@ -452,6 +505,50 @@ function lastEdge(harness: Harness, runId: string): EventEnvelope | undefined {
     .listByRun("P-v1", runId)
     .findLast((event) => event.event_type === "task.edge_selected");
 }
+
+describe("official_cli provider failure classification", () => {
+  const profile = makeAgentProfile({
+    failure_classification: {
+      provider_rate_limited_stderr: ["rate limit exceeded"],
+      provider_quota_exhausted_stderr: ["quota.*exhausted"],
+      provider_auth_failed_stderr: ["invalid api key"],
+    },
+  });
+
+  it.each([
+    ["provider_rate_limited", "RATE LIMIT EXCEEDED for this account"],
+    ["provider_quota_exhausted", "monthly quota is exhausted"],
+    ["provider_auth_failed", "Invalid API Key supplied"],
+  ] as const)("returns %s for matching stderr", (reason, stderrTail) => {
+    expect(
+      classifyOfficialCliFailure({
+        agentProfile: profile,
+        result: processResult({ stderrTail }),
+      }),
+    ).toBe(reason);
+  });
+
+  it("falls back to agent_nonzero_exit when stderr does not match", () => {
+    expect(
+      classifyOfficialCliFailure({
+        agentProfile: profile,
+        result: processResult({ stderrTail: "ordinary failure" }),
+      }),
+    ).toBe("agent_nonzero_exit");
+  });
+
+  it("does not classify provider patterns from stdout", () => {
+    expect(
+      classifyOfficialCliFailure({
+        agentProfile: profile,
+        result: processResult({
+          stdoutTail: "rate limit exceeded",
+          stderrTail: "ordinary failure",
+        }),
+      }),
+    ).toBe("agent_nonzero_exit");
+  });
+});
 
 async function runImplementer(
   harness: Harness,
@@ -550,6 +647,41 @@ describe("runTaskOnce implementer path", () => {
     );
   });
 
+  it("attaches a handoff packet to implementer prompt when provided", async () => {
+    const harness = makeHarness({
+      adapterMode: { kind: "result", finalReport: "# Done\n" },
+    });
+    const handoffPacketUri = "artifact://T-v1/run-previous/handoff_packet.json";
+    const handoffPacket = makeHandoffPacket();
+
+    const outcome = await runTaskOnce({
+      entry: makeEntry("implementer"),
+      decision: makeDecision("implementer"),
+      agentProfile: makeAgentProfile(),
+      workOrder: makeWorkOrder(harness.root, {
+        review: { enabled: false, max_review_runs: 0 },
+      }),
+      services: harness.services,
+      db: {} as Database,
+      handoffPacketUri,
+      handoffPacket,
+    });
+
+    const workspacePath = harness.sandboxProvider.prepared[0].workspacePath;
+    const handoffPath = path.join(workspacePath, ".agent-workflow", "handoff_packet.json");
+    const promptPath = path.join(workspacePath, ".agent-workflow", "prompt.md");
+    expect(outcome.kind).toBe("implementer_succeeded");
+    expect(harness.runStore.get(outcome.runId)?.handoff_packet_uri).toBe(handoffPacketUri);
+    expect(fs.existsSync(handoffPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(handoffPath, "utf-8"))).toMatchObject({
+      from_run_id: "run-previous",
+      from_agent_id: "agent-previous",
+    });
+    expect(fs.readFileSync(promptPath, "utf-8")).toContain(
+      "Taking Over a Previous Attempt",
+    );
+  });
+
   it("fails with agent_nonzero_exit when the adapter exits non-zero", async () => {
     const harness = makeHarness({
       adapterMode: { kind: "result", exitCode: 2 },
@@ -568,6 +700,46 @@ describe("runTaskOnce implementer path", () => {
       .find((event) => event.event_type === "run.failed");
     expect(failed?.payload).toMatchObject({ reason: "agent_nonzero_exit" });
     expect(outcome.diffArtifactUri).toContain("diff.patch");
+  });
+
+  it("classifies provider rate limits and still persists stdout/stderr artifacts", async () => {
+    const harness = makeHarness({
+      adapterMode: {
+        kind: "result",
+        exitCode: 2,
+        stdout: "provider stdout",
+        stderr: "Rate limit exceeded. Try again later.",
+      },
+    });
+    const outcome = await runTaskOnce({
+      entry: makeEntry("implementer"),
+      decision: makeDecision("implementer"),
+      agentProfile: makeAgentProfile({
+        failure_classification: {
+          provider_rate_limited_stderr: ["rate limit exceeded"],
+        },
+      }),
+      workOrder: makeWorkOrder(harness.root, {
+        verification: undefined,
+      }),
+      services: harness.services,
+      db: {} as Database,
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "implementer_failed",
+      reason: "provider_rate_limited",
+    });
+    const failed = harness.eventLog
+      .listByRun("P-v1", outcome.runId)
+      .find((event) => event.event_type === "run.failed");
+    expect(failed?.payload).toMatchObject({ reason: "provider_rate_limited" });
+    expect(harness.artifactStore.byKind("stdout_tail")[0]?.content).toBe(
+      "provider stdout",
+    );
+    expect(harness.artifactStore.byKind("stderr_tail")[0]?.content).toContain(
+      "Rate limit exceeded",
+    );
   });
 
   it("fails with agent_timed_out when the adapter times out", async () => {
@@ -631,7 +803,7 @@ describe("runTaskOnce reviewer path", () => {
 
     expect(outcome.kind).toBe("reviewer_approved");
     expect(outcome.reviewVerdictUri).toContain("review_verdict.json");
-    expect(harness.applyCalls[0]?.diffText).toContain("review me");
+    expect(harness.sandboxProvider.applyCalls[0]?.diffText).toContain("review me");
     expect(eventTypes(harness, outcome.runId)).toEqual(
       expect.arrayContaining([
         "review.requested",
@@ -755,5 +927,49 @@ describe("runTaskOnce reviewer path", () => {
       .listByRun("P-v1", outcome.runId)
       .find((event) => event.event_type === "run.failed");
     expect(failed?.payload).toMatchObject({ reason: "spawn_failed" });
+  });
+
+  it("classifies reviewer provider auth failures and persists stdout/stderr artifacts", async () => {
+    const harness = makeHarness({
+      adapterMode: {
+        kind: "result",
+        exitCode: 1,
+        stdout: "reviewer stdout",
+        stderr: "Invalid API key for reviewer account",
+      },
+    });
+    const outcome = await runTaskOnce({
+      entry: makeEntry("reviewer"),
+      decision: makeDecision("reviewer"),
+      agentProfile: makeAgentProfile({
+        failure_classification: {
+          provider_auth_failed_stderr: ["invalid api key"],
+        },
+      }),
+      workOrder: makeWorkOrder(harness.root),
+      services: harness.services,
+      db: {} as Database,
+      reviewContext: {
+        diffText: "diff --git a/file.txt b/file.txt\n+review me\n",
+        diffArtifactUri: "artifact://T-v1/run-implementer/diff.patch",
+        implementerRunId: "run-implementer",
+        implementerAgentId: "agent-impl",
+      },
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "reviewer_unusable",
+      reason: "provider_auth_failed",
+    });
+    const failed = harness.eventLog
+      .listByRun("P-v1", outcome.runId)
+      .find((event) => event.event_type === "run.failed");
+    expect(failed?.payload).toMatchObject({ reason: "provider_auth_failed" });
+    expect(harness.artifactStore.byKind("stdout_tail")[0]?.content).toBe(
+      "reviewer stdout",
+    );
+    expect(harness.artifactStore.byKind("stderr_tail")[0]?.content).toContain(
+      "Invalid API key",
+    );
   });
 });

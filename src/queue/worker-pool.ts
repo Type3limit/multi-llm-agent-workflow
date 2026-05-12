@@ -1,11 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { DefaultWorker, type Worker, type WorkerTaskHandler } from "./worker.js";
 import type { TaskQueue } from "./task-queue.js";
+import { OperationAbortedError, throwIfAborted } from "../core/abort-error.js";
 
 export interface WorkerPool {
   start(workers: number): void;
-  waitForAllTerminal(): Promise<void>;
+  waitForAllTerminal(options?: WaitForAllTerminalOptions): Promise<void>;
   stop(graceMs?: number): Promise<void>;
+}
+
+export interface WaitForAllTerminalOptions {
+  signal?: AbortSignal;
 }
 
 export interface WorkerServiceFactory {
@@ -18,7 +23,7 @@ export interface WorkerServiceFactory {
 
 export interface DefaultWorkerPoolOptions {
   factory: WorkerServiceFactory;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   createWorker?: (args: {
     workerId: string;
     queue: TaskQueue;
@@ -37,7 +42,7 @@ interface WorkerStartupRecord {
 
 export class DefaultWorkerPool implements WorkerPool {
   private readonly factory: WorkerServiceFactory;
-  private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly createWorkerFn: NonNullable<DefaultWorkerPoolOptions["createWorker"]>;
   private readonly expectedTerminalCount: number | undefined;
   private readonly monitorQueue: Pick<TaskQueue, "listTerminal"> | undefined;
@@ -50,8 +55,7 @@ export class DefaultWorkerPool implements WorkerPool {
 
   constructor(options: DefaultWorkerPoolOptions) {
     this.factory = options.factory;
-    this.sleepFn =
-      options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.sleepFn = options.sleep ?? abortableDelay;
     this.createWorkerFn =
       options.createWorker ??
       ((args) =>
@@ -102,16 +106,18 @@ export class DefaultWorkerPool implements WorkerPool {
     }
   }
 
-  async waitForAllTerminal(): Promise<void> {
+  async waitForAllTerminal(options: WaitForAllTerminalOptions = {}): Promise<void> {
     if (!this.monitorQueue || this.expectedTerminalCount === undefined) {
       throw new Error(
         "waitForAllTerminal requires monitorQueue and expectedTerminalCount in constructor options.",
       );
     }
 
+    throwIfAborted(options.signal);
     while (this.monitorQueue.listTerminal().length < this.expectedTerminalCount) {
-      await this.sleepFn(this.terminalPollMs);
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await waitForPromiseOrAbort(this.sleepFn(this.terminalPollMs, options.signal), options.signal);
+      await abortableDelay(0, options.signal);
+      throwIfAborted(options.signal);
     }
   }
 
@@ -156,5 +162,54 @@ export class DefaultWorkerPool implements WorkerPool {
         // Best effort cleanup. The original start error remains the important failure.
       }
     }
+  }
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    const onAbort = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      reject(new OperationAbortedError());
+    };
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function waitForPromiseOrAbort<T>(
+  promise: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  throwIfAborted(signal);
+  if (!signal) {
+    return await promise;
+  }
+
+  let onAbort: () => void = () => {};
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new OperationAbortedError());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([promise, abortPromise]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 }

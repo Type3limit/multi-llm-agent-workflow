@@ -131,6 +131,11 @@ export type AgentProfileV1 = {
     billing_unit: "token" | "call" | "wall_time" | "local_compute" | "unknown";
     estimated_cost_per_run_units: number;
   };
+  failure_classification?: {
+    provider_rate_limited_stderr?: string[];
+    provider_quota_exhausted_stderr?: string[];
+    provider_auth_failed_stderr?: string[];
+  };
   quota?: {
     soft_limit_ratio?: number;
     hard_limit_ratio?: number;
@@ -215,6 +220,7 @@ export type HandoffPacket = {
   reason:
     | "verification_failed"
     | "review_changes_requested"
+    | "diff_apply_failed"
     | "review_rejected"
     | "agent_timed_out"
     | "agent_nonzero_exit"
@@ -252,6 +258,14 @@ export type TaskQueueEntry = {
   attempts: number;
   enqueued_at: string;
   updated_at: string;
+};
+
+export type ReviewContextRecord = {
+  implementer_run_id: string;
+  implementer_agent_id: string;
+  diff_artifact_uri: string;
+  final_report_uri?: string;
+  verification_output_uri?: string;
 };
 
 export type AgentRegistryEntry = {
